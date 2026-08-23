@@ -1,0 +1,11 @@
+product_id,sku,name,category,description,brand,price,currency,stock_quantity,rating,availability
+1,ELC-001,Wireless Noise-Cancelling Headphones,Electronics,"Over-ear Bluetooth headphones with active noise cancellation and 30-hour battery life.",SoundSphere,129.99,USD,42,4.6,in_stock
+2,ELC-002,USB-C Fast Charger 65W,Electronics,"Compact dual-port USB-C wall charger suitable for laptops, tablets, and phones.",VoltEdge,34.99,USD,85,4.7,in_stock
+3,HM-001,Stainless Steel Water Bottle,Home & Kitchen,"Insulated 750 ml reusable bottle that keeps drinks cold for 24 hours.",EverSip,24.50,USD,120,4.5,in_stock
+4,HM-002,Organic Cotton Bedding Set,Home & Kitchen,"Soft breathable queen-size duvet cover and pillowcase set made from organic cotton.",Nest & Loom,89.00,USD,18,4.4,in_stock
+5,FAS-001,Classic Canvas Sneakers,Footwear,"Everyday low-top sneakers with a durable canvas upper and cushioned rubber sole.",Northline,59.95,USD,33,4.3,in_stock
+6,FAS-002,Waterproof Hiking Jacket,Apparel,"Lightweight hooded shell jacket with sealed seams and adjustable cuffs for outdoor use.",Trailmark,119.00,USD,9,4.8,low_stock
+7,BTY-001,Vitamin C Face Serum,Beauty,"Brightening facial serum with vitamin C, hyaluronic acid, and aloe vera.",GlowLab,22.99,USD,64,4.2,in_stock
+8,SPT-001,Adjustable Yoga Mat,Sports & Fitness,"Non-slip 6 mm exercise mat with alignment markings and a carry strap.",FlexForm,39.99,USD,27,4.6,in_stock
+9,OFF-001,Minimalist Leather Notebook,Office & Stationery,"A5 lined notebook with recycled paper and a durable vegan leather cover.",Paper & Pine,18.75,USD,51,4.5,in_stock
+10,TOY-001,Wooden Building Blocks,Kids & Toys,"Set of 50 colorful sustainably sourced wooden blocks for creative play.",BrightNest,31.50,USD,6,4.9,low_stock
