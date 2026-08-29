@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Operate your agent-native {{ app_name }} storefront." />
+    <meta name="theme-color" content="#103f31" />
+    <title>{{ app_name }} · Control plane</title>
+    <link rel="stylesheet" href="{{ static_root }}/app.css" />
+    <script src="{{ static_root }}/app.js" defer></script>
+  </head>
+  <body data-api-root="{{ api_root }}" data-agent-root="{{ agent_root }}" data-vendor-key="{{ vendor_key }}" data-app-name="{{ app_name }}" data-chat-history-limit="{{ chat_history_limit }}">
+    <a class="skip-link" href="#main-content">Skip to workspace</a>
+
+    <div class="app-shell">
+      <aside class="rail" aria-label="{{ app_name }} navigation">
+        <a class="brand" href="#overview" data-nav="overview" aria-label="{{ app_name }} overview">
+          <span class="brand-mark" aria-hidden="true">↗</span>
+          <span>
+            <strong>{{ app_name }}</strong>
+            <small>Control plane</small>
+          </span>
+        </a>
+
+        <nav class="primary-nav" aria-label="Workspace">
+          <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
+            <span aria-hidden="true">⌂</span><span>Overview</span>
+          </button>
+          <button class="nav-item" type="button" data-view="sources">
+            <span aria-hidden="true">＋</span><span>Sources</span>
+          </button>
+          <button class="nav-item" type="button" data-view="catalog">
+            <span aria-hidden="true">▦</span><span>Catalog</span>
+          </button>
+          <button class="nav-item" type="button" data-view="mapping">
+            <span aria-hidden="true">↔</span><span>Mapping</span>
+          </button>
+          <button class="nav-item" type="button" data-view="agent">
+            <span aria-hidden="true">{ }</span><span>Agent site</span>
+          </button>
+          <button class="nav-item" type="button" data-view="chat">
+            <span aria-hidden="true">✦</span><span>Chat</span>
+          </button>
+          <button class="nav-item" type="button" data-view="activity">
+            <span aria-hidden="true">◷</span><span>Activity</span>
+          </button>
+        </nav>
+
+        <div class="rail-status">
+          <span class="signal" id="rail-signal" aria-hidden="true"></span>
+          <span><strong id="rail-status-title">Checking system</strong><small id="rail-status-copy">Connecting to the control plane</small></span>
+        </div>
+        <p class="rail-caption">Machine pages, not mystery tools.</p>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="merchant-control">
+            <label for="vendor-select">Active storefront</label>
+            <div class="select-wrap">
+              <span class="vendor-dot" aria-hidden="true"></span>
+              <select id="vendor-select" aria-describedby="vendor-context">
+                <option value="">Loading storefronts…</option>
+              </select>
+            </div>
+            <span id="vendor-context" class="sr-only">Changes every dashboard view to the selected storefront.</span>
+          </div>
+          <div class="topbar-actions">
+            <span class="health-pill" id="health-pill" role="status"><span aria-hidden="true"></span>Checking API</span>
+            <button class="button button-quiet" type="button" data-go="sources"><span aria-hidden="true">＋</span> Connect source</button>
+          </div>
+        </header>
+
+        <div id="global-notice" class="global-notice" role="status" aria-live="polite" hidden>
+          <span id="global-notice-text"></span>
+          <button id="dismiss-notice" type="button" aria-label="Dismiss notification">×</button>
+        </div>
+
+        <main id="main-content" tabindex="-1">
+          <section class="view" id="view-overview" data-page="overview" aria-labelledby="overview-title">
+            <div class="hero">
+              <div class="hero-copy">
+                <p class="eyebrow">Agent commerce operations</p>
+                <h1 id="overview-title">A storefront agents can actually read.</h1>
+                <p id="overview-summary">Connect a source, preserve every field, and publish a traversable machine-first catalog.</p>
+                <div class="hero-actions">
+                  <button class="button button-primary" id="overview-sync" type="button"><span aria-hidden="true">↻</span> Sync catalog</button>
+                  <button class="button button-secondary" type="button" data-go="agent">Inspect agent site <span aria-hidden="true">→</span></button>
+                </div>
+              </div>
+              <div class="page-orbit" aria-label="Agent site publishing flow">
+                <div class="orbit-head"><span>LIVE PAGE GRAPH</span><span class="orbit-pulse">publishing</span></div>
+                <div class="route route-home"><span>01</span><strong>Store home</strong><small>{{ agent_root }}/store/</small></div>
+                <div class="route route-catalog"><span>02</span><strong>Resources</strong><small>linked + lossless</small></div>
+                <div class="route route-record"><span>03</span><strong>Record</strong><small>actions in context</small></div>
+              </div>
+            </div>
+
+            <div class="metric-grid" aria-label="Storefront metrics">
+              <article class="metric-card metric-featured">
+                <span class="metric-label">Readiness</span>
+                <strong id="metric-readiness">—</strong>
+                <span id="metric-readiness-copy">Waiting for a storefront</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-label">Normalized records</span>
+                <strong id="metric-records">—</strong>
+                <span>Source fields retained</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-label">Resources</span>
+                <strong id="metric-resources">—</strong>
+                <span>Browsable collections</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-label">Last publication</span>
+                <strong id="metric-sync">—</strong>
+                <span id="metric-sync-copy">No sync loaded</span>
+              </article>
+            </div>
+
+            <div class="overview-grid">
+              <article class="panel readiness-panel" aria-labelledby="readiness-title">
+                <div class="panel-heading">
+                  <div><p class="kicker">Projection quality</p><h2 id="readiness-title">Mapping readiness</h2></div>
+                  <span class="status-chip" id="readiness-chip">Not assessed</span>
+                </div>
+                <div class="readiness-gauge" aria-hidden="true"><span id="readiness-bar"></span></div>
+                <p class="panel-copy" id="readiness-copy">Select a storefront to review deterministic commerce mappings.</p>
+                <ul class="check-list" id="readiness-list"></ul>
+                <button class="text-button" type="button" data-go="mapping">Review field mapping <span aria-hidden="true">→</span></button>
+              </article>
+
+              <article class="panel endpoint-panel" aria-labelledby="endpoint-title">
+                <div class="panel-heading">
+                  <div><p class="kicker">Canonical entrypoint</p><h2 id="endpoint-title">Agent storefront</h2></div>
+                  <span class="protocol-chip">JSON · linked</span>
+                </div>
+                <p class="panel-copy">Agents begin at one URL and discover every valid next move from the page itself.</p>
+                <div class="code-line">
+                  <code id="overview-agent-url">No storefront selected</code>
+                  <button class="icon-button" id="copy-overview-url" type="button" aria-label="Copy agent storefront URL">Copy</button>
+                </div>
+                <div class="mini-stats">
+                  <span><small>Profile</small><strong>Agent Page {{ agent_page_version }}</strong></span>
+                  <span><small>Commerce</small><strong>UCP {{ ucp_version }}</strong></span>
+                </div>
+              </article>
+
+              <article class="panel activity-preview" aria-labelledby="recent-title">
+                <div class="panel-heading">
+                  <div><p class="kicker">Publication ledger</p><h2 id="recent-title">Recent sync</h2></div>
+                  <button class="text-button" type="button" data-go="activity">View history</button>
+                </div>
+                <div id="recent-sync" class="state-slot" aria-live="polite"></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="view" id="view-sources" data-page="sources" aria-labelledby="sources-title" hidden>
+            <div class="section-heading">
+              <div><p class="eyebrow">Source control</p><h1 id="sources-title">Bring the catalog you already have.</h1><p>{{ app_name }} reads the source in place, preserves its shape, and publishes only after a complete revision succeeds.</p></div>
+              <button class="button button-primary" id="source-sync" type="button"><span aria-hidden="true">↻</span> Sync selected</button>
+            </div>
+
+            <div class="source-grid">
+              <article class="panel source-current" aria-labelledby="current-source-title">
+                <div class="panel-heading"><div><p class="kicker">Active connection</p><h2 id="current-source-title">Selected source</h2></div><span class="status-chip" id="source-status">No source</span></div>
+                <div id="source-summary" class="state-slot"></div>
+              </article>
+
+              <article class="panel onboarding-panel" aria-labelledby="onboarding-title">
+                <p class="kicker">New storefront</p>
+                <h2 id="onboarding-title">Connect a source</h2>
+                <p class="panel-copy">Paths are validated by the server and must live inside an approved source root.</p>
+                <form id="vendor-form">
+                  <div class="field-row">
+                    <label>Storefront name<input name="name" required maxlength="120" autocomplete="organization" placeholder="Acme Supply" /></label>
+                    <label>URL slug <span class="optional">Optional</span><input name="slug" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" spellcheck="false" placeholder="acme-supply" /></label>
+                  </div>
+                  <div class="field-row">
+                    <label>Source format<select name="kind" required><option value="csv">CSV</option><option value="json">JSON</option><option value="sqlite">SQLite</option></select></label>
+                    <label class="path-field">Source path<input name="path" required spellcheck="false" placeholder="vendor_databases/acme/catalog.csv" /></label>
+                  </div>
+                  <label class="check-control"><input name="public" type="checkbox" checked /><span>Publish this catalog on the public agent site</span></label>
+                  <div class="form-footer">
+                    <p id="vendor-form-status" class="form-status" role="status" aria-live="polite"></p>
+                    <button class="button button-primary" id="vendor-submit" type="submit">Connect storefront <span aria-hidden="true">→</span></button>
+                  </div>
+                </form>
+              </article>
+            </div>
+          </section>
+
+          <section class="view" id="view-catalog" data-page="catalog" aria-labelledby="catalog-title" hidden>
+            <div class="section-heading compact">
+              <div><p class="eyebrow">Lossless explorer</p><h1 id="catalog-title">Catalog records</h1><p>Inspect exactly what was recovered from the source—before any commerce projection.</p></div>
+              <label class="search-control"><span class="sr-only">Search catalog records</span><span aria-hidden="true">⌕</span><input id="catalog-search" type="search" placeholder="Search the selected resource" aria-keyshortcuts="Control+K Meta+K" /></label>
+            </div>
+
+            <div class="explorer">
+              <aside class="resource-pane" aria-labelledby="resources-title">
+                <div class="pane-heading"><h2 id="resources-title">Resources</h2><span id="resource-count">0</span></div>
+                <div id="resource-list" class="resource-list state-slot" role="listbox" aria-label="Normalized resources"></div>
+              </aside>
+              <section class="records-pane" aria-labelledby="records-title">
+                <div class="pane-heading"><div><h2 id="records-title">Records</h2><p id="records-caption">Choose a resource to begin.</p></div><span id="record-count">0</span></div>
+                <div class="table-wrap">
+                  <table>
+                    <caption class="sr-only">Normalized catalog records</caption>
+                    <thead id="records-head"></thead>
+                    <tbody id="records-body"></tbody>
+                  </table>
+                  <div id="records-state" class="state-slot"></div>
+                </div>
+              </section>
+              <aside class="record-pane" aria-labelledby="record-title">
+                <div class="pane-heading"><div><p class="kicker">Raw record</p><h2 id="record-title">Inspector</h2></div><button class="icon-button" id="copy-record" type="button" disabled>Copy JSON</button></div>
+                <pre id="record-json" tabindex="0">Select a record to inspect every retained field.</pre>
+              </aside>
+            </div>
+          </section>
+
+          <section class="view" id="view-mapping" data-page="mapping" aria-labelledby="mapping-title" hidden>
+            <div class="section-heading">
+              <div><p class="eyebrow">Deterministic projection</p><h1 id="mapping-title">Map meaning without losing data.</h1><p>Approve how source fields become UCP commerce fields. Raw records remain unchanged.</p></div>
+              <div class="readiness-score"><span id="mapping-score">0%</span><small>ready</small></div>
+            </div>
+            <form id="mapping-form" class="mapping-layout">
+              <article class="panel mapping-main">
+                <div class="mapping-controls">
+                  <label>Product resource<select id="mapping-resource" name="resource"></select></label>
+                  <label>Price units<select id="price-units" name="price_units"><option value="">Not mapped</option><option value="major">Major units</option><option value="minor">Minor units</option></select></label>
+                  <label>Default currency<input id="default-currency" name="default_currency" maxlength="3" placeholder="USD" /></label>
+                </div>
+                <div class="mapping-heading"><span>Commerce field</span><span>Source field</span></div>
+                <div id="mapping-fields" class="mapping-fields state-slot"></div>
+                <div class="form-footer mapping-footer">
+                  <p id="mapping-status" class="form-status" role="status" aria-live="polite"></p>
+                  <button class="button button-primary" id="mapping-submit" type="submit">Publish mapping <span aria-hidden="true">→</span></button>
+                </div>
+              </article>
+              <aside class="panel mapping-guide">
+                <p class="kicker">Readiness rules</p><h2>Only asserted facts graduate.</h2>
+                <p class="panel-copy">Suggestions come from deterministic field-name similarity. Review them before publishing.</p>
+                <ul class="check-list" id="mapping-checks"></ul>
+                <div class="principle"><span aria-hidden="true">◎</span><p><strong>Lossless by design</strong>Unmapped fields stay available to agents in the original record.</p></div>
+              </aside>
+            </form>
+          </section>
+
+          <section class="view" id="view-agent" data-page="agent" aria-labelledby="agent-title" hidden>
+            <div class="section-heading compact">
+              <div><p class="eyebrow">Machine storefront</p><h1 id="agent-title">Agent site inspector</h1><p>See the exact linked page an AI receives—without a screenshot, selector, or global tool list.</p></div>
+              <a class="button button-secondary is-disabled" id="open-agent" href="#" target="_blank" rel="noopener">Open endpoint <span aria-hidden="true">↗</span></a>
+            </div>
+            <article class="inspector">
+              <div class="inspector-toolbar">
+                <div class="segmented" role="tablist" aria-label="Agent document">
+                  <button type="button" role="tab" aria-selected="true" data-document="home">Store home</button>
+                  <button type="button" role="tab" aria-selected="false" data-document="ucp">UCP profile</button>
+                  <button type="button" role="tab" aria-selected="false" data-document="schema">Store schema</button>
+                </div>
+                <div class="inspector-actions"><span id="agent-fetch-status" role="status">Not loaded</span><button class="icon-button" id="copy-agent-json" type="button" disabled>Copy JSON</button></div>
+              </div>
+              <div class="inspector-location"><span>GET</span><code id="agent-document-url">Select a storefront</code></div>
+              <pre id="agent-json" tabindex="0">The live machine page will appear here.</pre>
+            </article>
+          </section>
+
+          <section class="view" id="view-chat" data-page="chat" aria-labelledby="chat-title" hidden>
+            <div class="section-heading compact">
+              <div><p class="eyebrow">Grounded assistant</p><h1 id="chat-title">Ask the catalog.</h1><p>Answers are bounded to retrieved records and link back to the agent storefront.</p></div>
+              <span class="mode-chip" id="chat-mode">Deterministic fallback ready</span>
+            </div>
+            <div class="chat-layout">
+              <section class="chat-panel" aria-label="Catalog conversation">
+                <div id="chat-log" class="chat-log" role="log" aria-live="polite" aria-relevant="additions"></div>
+                <div class="prompt-suggestions" id="prompt-suggestions" aria-label="Suggested questions">
+                  <button type="button">What products are available?</button>
+                  <button type="button">Show the strongest rated items</button>
+                  <button type="button">Which categories can I browse?</button>
+                </div>
+                <form id="chat-form" class="chat-form">
+                  <label class="sr-only" for="chat-input">Ask a catalog question</label>
+                  <textarea id="chat-input" name="message" rows="1" maxlength="{{ chat_question_limit }}" placeholder="Ask about products, categories, prices, or source details…" required></textarea>
+                  <button class="send-button" id="chat-submit" type="submit" aria-label="Send message">↑</button>
+                </form>
+                <p class="chat-note">Catalog content is treated as untrusted data. Responses may be deterministic when no model provider is configured.</p>
+              </section>
+              <aside class="panel context-panel" aria-labelledby="context-title">
+                <p class="kicker">Current grounding</p><h2 id="context-title">Store context</h2>
+                <div id="chat-context" class="state-slot"></div>
+              </aside>
+            </div>
+          </section>
+
+          <section class="view" id="view-activity" data-page="activity" aria-labelledby="activity-title" hidden>
+            <div class="section-heading compact">
+              <div><p class="eyebrow">Publication ledger</p><h1 id="activity-title">Sync history</h1><p>Every revision is visible. Failed publications leave the previous good catalog untouched.</p></div>
+              <button class="button button-primary" id="activity-sync" type="button"><span aria-hidden="true">↻</span> Start sync</button>
+            </div>
+            <article class="panel activity-panel">
+              <div class="activity-head"><span>Revision</span><span>Status</span><span>Resources</span><span>Records</span><span>Finished</span></div>
+              <div id="activity-list" class="activity-list state-slot" aria-live="polite"></div>
+            </article>
+          </section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>
