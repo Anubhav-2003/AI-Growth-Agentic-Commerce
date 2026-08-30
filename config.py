@@ -47,6 +47,7 @@ class LimitConfig(BaseModel):
     chat_context_characters: int = Field(gt=0)
     chat_question_characters: int = Field(gt=0)
     chat_history_messages: int = Field(gt=0)
+    agent_max_steps: int = Field(gt=0)
     model_timeout_seconds: int = Field(gt=0)
     mongo_timeout_milliseconds: int = Field(gt=0)
 
@@ -126,10 +127,16 @@ class Settings(BaseSettings):
     admin_api_key: SecretStr | None = None
     model_provider: str | None = None
     model_name: str | None = None
+    model_api_key: SecretStr | None = None
     model_api_base: str | None = None
 
     @field_validator(
-        "admin_api_key", "model_provider", "model_name", "model_api_base", mode="before"
+        "admin_api_key",
+        "model_provider",
+        "model_name",
+        "model_api_key",
+        "model_api_base",
+        mode="before",
     )
     @classmethod
     def blank_optional_values(cls, value: object) -> object | None:
