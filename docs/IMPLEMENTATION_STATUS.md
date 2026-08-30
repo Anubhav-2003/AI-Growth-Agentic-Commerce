@@ -16,8 +16,13 @@
 - Built the human dashboard.
 - Added source registration, synchronization, catalog browsing, and mapping screens.
 - Added the agent-page inspector and activity screen.
-- Added catalog chat using AnyLLM.
-- Added a useful chat fallback that works without an AI model key.
+- Added a LangGraph shopping agent that starts at the machine storefront home page.
+- Added Pydantic-structured `follow`, `submit`, and `answer` decisions through AnyLLM.
+- Added an allow-listed HTTPX executor that accepts only controls advertised by the current page.
+- Replaced direct catalog-RAG chat with a bounded page → decision → page loop.
+- Added exact model-selected record citations and a visible navigation trace.
+- Added a no-key fallback that traverses home → search instead of querying Mongo directly.
+- Verified a live Gemini run that searched twice, opened both requested records, and returned a grounded comparison.
 - Added automated tests for the main workflows.
 - Tested the complete CSV-to-agent-store workflow successfully.
 

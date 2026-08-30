@@ -5,7 +5,7 @@ CommerceOS turns an existing CSV, JSON document, or SQLite database into two vie
 - a lossless normalized record store that retains source fields and relationships; and
 - a linked JSON website that an AI agent can browse without screenshots, selectors, or a global tool list.
 
-A FastAPI control plane provides source setup, synchronization, mapping, inspection, and grounded chat. MongoDB stores vendor configuration, active catalog revisions, sync history, and exact source artifacts. See the [implementation plan](docs/IMPLEMENTATION_PLAN.md) for the full architecture, research record, and scope decisions.
+A FastAPI control plane provides source setup, synchronization, mapping, inspection, and a LangGraph shopping agent that traverses the same JSON website exposed to external agents. MongoDB stores vendor configuration, active catalog revisions, sync history, and exact source artifacts. See the [implementation plan](docs/IMPLEMENTATION_PLAN.md) for the full architecture, research record, and scope decisions.
 
 ## Prerequisites
 
@@ -53,9 +53,12 @@ Startup pings MongoDB and creates the required indexes. The process will not bec
 | `ADMIN_API_KEY` | Optional local, required outside configured local environments | blank locally |
 | `MODEL_PROVIDER` | AnyLLM provider identifier | blank |
 | `MODEL_NAME` | Provider model identifier | blank |
+| `MODEL_API_KEY` | Server-side API key for the selected provider | blank |
 | `MODEL_API_BASE` | Optional provider-compatible API base | blank |
 
-Set the provider-standard secret expected by AnyLLM, such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, when enabling model chat. Keys stay server-side.
+Set `MODEL_PROVIDER`, `MODEL_NAME`, and `MODEL_API_KEY` to enable model chat. The key is passed only to AnyLLM on the server and is never exposed to the browser or stored in MongoDB. Provider-standard environment variables remain supported when the service process supplies them, but `MODEL_API_KEY` is the portable `.env` setting.
+
+AnyLLM directly supports `gemini` and `groq`; model IDs stay configuration values so releases do not require source changes. As of 2026-08-30, Google lists `gemini-3.7-flash` as its latest stable Gemini model, and Groq lists `openai/gpt-oss-120b` as a current production model. Groq has deprecated Llama 3.3 70B for developer-tier use; use the provider's live model list when selecting an ID. See the [Gemini model guide](https://ai.google.dev/gemini-api/docs/models) and [Groq supported models](https://console.groq.com/docs/models).
 
 [`config/commerce.yml`](config/commerce.yml) is the validated, non-secret source for route prefixes, collection names, supported extensions, batch/page/size limits, security header and local environments, mapping aliases, UCP metadata, agent-page profile, and grounded-chat copy. Do not put secrets there.
 
@@ -84,7 +87,7 @@ Open `/` to use the single responsive control plane:
 - **Catalog** — browse resources, search records, and inspect retained JSON
 - **Mapping** — review deterministic field-name suggestions and publish explicit semantics
 - **Agent site** — inspect the store home, UCP discovery document, and page schema
-- **Chat** — query the selected catalog with citations to exact agent record pages
+- **Chat** — watch an AI traverse live machine pages and answer with exact record citations
 - **Activity** — inspect successful and failed revision history
 
 The old `/register`, `/login`, and `/home` URLs redirect to this dashboard. A remembered vendor ID in browser storage is only a UI selection preference; it is not authentication.
@@ -220,12 +223,13 @@ The path-scoped discovery URL is a development gateway convenience. A hostname-p
 
 ## Chat and AnyLLM
 
-Chat deterministically retrieves a bounded set of matching active records before answering:
+Configured chat is a bounded website-browsing agent, not a direct retrieval prompt:
 
-- Unless both `MODEL_PROVIDER` and `MODEL_NAME` are configured, it returns a concise exact-data summary with `mode: "deterministic"`.
-- With both configured, the reusable AnyLLM client sends bounded history and catalog context to the selected provider and returns `mode: "model"`.
-- With no retrieved records, it returns the configured no-results message rather than inventing an answer.
-- Every response includes source labels and absolute agent record URLs.
+- LangGraph opens `/agent/{store}/`, asks AnyLLM for one Pydantic-validated `follow`, `submit`, or `answer` decision, executes that decision against the mounted FastAPI site with HTTPX, and repeats.
+- Follow targets must exactly match a current page link or entity. Submitted action inputs must pass the JSON Schema advertised by that page, and every request stays within the current storefront.
+- `mode: "agent"` responses include the final answer, selected supporting record URLs, and a navigation trace without hidden model reasoning.
+- Without a configured provider/model, `mode: "deterministic"` still traverses home → search and summarizes exact returned entities. It never restores the old direct-Mongo chat shortcut.
+- Runs stop at the configured `agent_max_steps` boundary and return the best available evidence if a model fails to finish.
 
 Merchant content is delimited as untrusted data, never promoted to model instructions. Provider errors become safe HTTP 502 problems. Models do not participate in source parsing, identities, schema discovery, mapping, price conversion, or revision publication.
 
@@ -262,7 +266,7 @@ models.py                          Pydantic management and agent-page contracts
 services/normalization_service.py  Lossless CSV/JSON/SQLite normalization
 services/catalog_service.py        Mongo persistence, revisions, queries, and projection
 agent_web/app.py                   Nested linked-JSON and UCP application
-model_layer/client.py              Optional AnyLLM gateway and deterministic fallback
+model_layer/client.py              AnyLLM decisions and LangGraph agent-page browser
 human_ui/                          Dashboard template, styles, and browser client
 tests/                             Agent, model, normalization, and integration coverage
 vendor_databases/                  Local example source data
@@ -278,7 +282,7 @@ This release proves lossless local-source normalization, explicit projection, li
 - Shopify, WooCommerce, Magento, remote SQL, object-store, webhook, or live write-back adapters;
 - background jobs for long synchronizations;
 - vector or embedding search;
-- MCP, A2A, ACP, or autonomous browser automation;
+- MCP, A2A, ACP, or automation of conventional HTML/screenshot websites;
 - generative normalization or mapping.
 
 Do not advertise or build operational workflows on those absent capabilities. Extend the shared lossless records and catalog service rather than creating a parallel source of truth.
