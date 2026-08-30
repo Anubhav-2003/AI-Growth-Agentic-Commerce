@@ -1,6 +1,6 @@
 # Human Control Plane UI
 
-This folder contains the static browser assets for the merchant dashboard and catalog-grounded chat interface.
+This folder contains the static browser assets for the merchant dashboard and agent-website chat interface.
 
 - `index.html` — the accessible dashboard shell and view markup.
 - `app.css` — shared responsive visual styles.

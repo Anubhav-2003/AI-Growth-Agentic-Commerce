@@ -764,7 +764,7 @@ function renderChat() {
   log.replaceChildren();
   if (!state.chat.length && !state.chatPending) {
     const empty = make("div", "chat-empty");
-    empty.append(make("span", "chat-glyph", "✦"), make("h2", "", state.vendor ? `Ask about ${state.vendor.name || "this catalog"}` : "Select a storefront first"), make("p", "", `${settings.appName} retrieves bounded source records before answering and returns the pages that support each result.`));
+    empty.append(make("span", "chat-glyph", "✦"), make("h2", "", state.vendor ? `Ask about ${state.vendor.name || "this catalog"}` : "Select a storefront first"), make("p", "", `${settings.appName} enters the machine storefront, follows its live controls, and returns the pages that support the answer.`));
     log.append(empty);
   }
   for (const message of state.chat) {
@@ -783,14 +783,19 @@ function renderChat() {
       }
       item.append(sources);
     }
+    if (message.trace?.length) {
+      const trace = make("div", "chat-trace");
+      for (const step of message.trace) trace.append(make("span", "", `${step.operation} · ${step.title || step.page_type || "page"}`));
+      item.append(trace);
+    }
     log.append(item);
   }
   if (state.chatPending) {
     const item = make("article", "chat-message is-assistant");
     const dots = make("div", "typing");
-    dots.setAttribute("aria-label", `${settings.appName} is retrieving catalog records`);
+    dots.setAttribute("aria-label", `${settings.appName} is browsing the machine storefront`);
     dots.append(make("span"), make("span"), make("span"));
-    item.append(make("span", "chat-message-label", `${settings.appName} · retrieving`), dots);
+    item.append(make("span", "chat-message-label", `${settings.appName} · browsing`), dots);
     log.append(item);
   }
   byId("chat-input").disabled = !state.vendor || state.chatPending;
@@ -799,7 +804,7 @@ function renderChat() {
   renderChatContext();
 }
 
-// Show exactly which store and resource bounds apply to chat retrieval.
+// Show exactly which storefront bounds apply to agent browsing.
 function renderChatContext() {
   const container = byId("chat-context");
   if (!state.vendor) return showState(container, "No active context", "Select a storefront before asking a question.");
@@ -829,8 +834,8 @@ async function sendChat(event) {
   renderChat();
   try {
     const result = await fetchJson(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/chat`), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, history }) });
-    state.chat.push({ role: "assistant", content: result?.answer || "No grounded answer was returned.", mode: result?.mode || "grounded", sources: result?.sources || [] });
-    byId("chat-mode").textContent = result?.mode === "model" ? "Model · catalog grounded" : "Deterministic retrieval";
+    state.chat.push({ role: "assistant", content: result?.answer || "No grounded answer was returned.", mode: result?.mode || "grounded", sources: result?.sources || [], trace: result?.trace || [] });
+    byId("chat-mode").textContent = result?.mode === "agent" ? "Agent · website traversal" : "Deterministic website search";
   } catch (error) {
     state.chat.push({ role: "assistant", content: `I could not retrieve a grounded answer: ${error.message}`, mode: "error", sources: [] });
   } finally {

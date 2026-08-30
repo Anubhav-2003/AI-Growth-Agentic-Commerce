@@ -501,6 +501,8 @@ td { padding: 0; border-bottom: 1px solid #e8ede7; }
 .is-assistant .chat-bubble { color: var(--ink-soft); background: #edf4ed; border: 1px solid #dfebe1; }
 .chat-sources { display: flex; flex-wrap: wrap; gap: 6px; }
 .chat-sources a { max-width: 250px; overflow: hidden; padding: 5px 8px; color: var(--moss); font-size: 0.61rem; font-weight: 730; text-overflow: ellipsis; white-space: nowrap; background: var(--mint); border-radius: 6px; }
+.chat-trace { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.chat-trace span { padding: 4px 7px; color: var(--muted); font-size: 0.58rem; background: var(--paper-strong); border: 1px solid var(--line); border-radius: 999px; }
 .typing { display: flex; gap: 4px; padding: 4px 1px; }
 .typing span { width: 6px; height: 6px; background: #74a78b; border-radius: 50%; animation: typing 900ms infinite alternate; }
 .typing span:nth-child(2) { animation-delay: 160ms; }
