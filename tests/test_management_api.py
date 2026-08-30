@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,6 +15,7 @@ from pymongo import MongoClient
 
 from config import Settings, get_settings
 from main import create_app
+from models import BrowserDecision
 
 _DATABASE_PREFIX = "commerceos_management_pytest_"
 
@@ -247,6 +250,77 @@ def test_vendor_sync_mapping_records_and_grounded_chat(
     cited_page = client.get(citation["href"])
     assert cited_page.status_code == 200
     assert cited_page.json()["data"]["data"]["sku"] == "p-moss"
+
+    visited: list[str] = []
+    opened_records: list[str] = []
+
+    class ScriptedBrowserModel:
+        """Choose controls from each real page to prove the complete browsing loop."""
+
+        async def acompletion(self, **kwargs: Any) -> Any:
+            """Return a validated decision based only on the supplied current page."""
+            prompt = kwargs["messages"][-1]["content"]
+            current = prompt.split("<current-agent-page>", 1)[1].split("</current-agent-page>", 1)[
+                0
+            ]
+            page = json.loads(current)
+            page_type = page["page"]["type"]
+            visited.append(page_type)
+            assert kwargs["response_format"] is BrowserDecision
+            if page_type == "store":
+                decision = BrowserDecision(
+                    operation="submit",
+                    target="search",
+                    inputs={"q": "Moss Lamp Mint Mug", "limit": 5},
+                )
+            elif page_type == "search-results":
+                entity = next(
+                    item for item in page["entities"] if item["commerce"]["title"] == "Moss Lamp"
+                )
+                decision = BrowserDecision(operation="follow", target=entity["href"])
+            elif page_type == "record" and page["page"]["title"] == "Moss Lamp":
+                opened_records.append(page["page"]["id"])
+                collection = next(
+                    item["href"] for item in page["links"] if "collection" in item["rel"]
+                )
+                decision = BrowserDecision(operation="follow", target=collection)
+            elif page_type == "resource":
+                entity = next(
+                    item for item in page["entities"] if item["commerce"]["title"] == "Mint Mug"
+                )
+                decision = BrowserDecision(operation="follow", target=entity["href"])
+            else:
+                opened_records.append(page["page"]["id"])
+                decision = BrowserDecision(
+                    operation="answer",
+                    answer=(
+                        "The Moss Lamp is a warm desk light priced at $12.99, while the Mint "
+                        "Mug is a stoneware cup priced at $24.00. Choose the lamp for lighting "
+                        "a workspace and the mug for drinkware; they serve different needs."
+                    ),
+                    citations=opened_records,
+                )
+            message = SimpleNamespace(parsed=decision, content=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    browser = client.app.state.agent_browser
+    browser.model.client = ScriptedBrowserModel()
+    try:
+        agent_chat = client.post(
+            f"/api/vendors/{vendor_id}/chat",
+            json={"message": "Compare the Moss Lamp and Mint Mug.", "history": []},
+        )
+    finally:
+        browser.model.client = None
+
+    assert agent_chat.status_code == 200
+    agent_answer = agent_chat.json()
+    assert agent_answer["mode"] == "agent"
+    assert "$12.99" in agent_answer["answer"] and "$24.00" in agent_answer["answer"]
+    assert visited == ["store", "search-results", "record", "resource", "record"]
+    assert [item["page_type"] for item in agent_answer["trace"]] == visited
+    assert len(agent_answer["sources"]) == 2
+    assert all(client.get(item["href"]).status_code == 200 for item in agent_answer["sources"])
 
     final_detail = client.get(f"/api/vendors/{vendor_id}").json()
     assert final_detail["stats"]["resources"] == 1
