@@ -21,6 +21,12 @@ agent enters store
     → sees only the actions currently available from that page
 ```
 
+The built-in shopping assistant must use that same path. It may not bypass the agent
+website by querying `CatalogService` and placing retrieved rows directly in a prompt. Its
+runtime starts from the store home page, gives the current JSON page to the model, validates
+one structured `follow`, `submit`, or `answer` decision, executes only a transition advertised
+by that page, and repeats until the model answers or reaches the configured step limit.
+
 The same outer FastAPI application also serves a polished human control plane containing merchant onboarding, synchronization health, source/schema inspection, field-mapping readiness, an agent-page inspector, and a catalog-grounded chat interface.
 
 The implementation will use two deliberately separate data tiers:
@@ -48,6 +54,8 @@ This separation is essential. An arbitrary column named `x7` cannot be proven to
 | AI web layer is its own folder and inner server | `agent_web/` contains the nested FastAPI application and page builders | Mounted-subapplication route tests |
 | Human UI contains a proper chatbot and dashboard | One cohesive responsive application replaces the three duplicated prototype pages | API-backed onboarding, sync, explorer, chat, and inspector flows |
 | Model layer uses any-llm | Thin `ModelGateway` wrapper uses Mozilla AI's `any-llm`; API keys remain server-side | Mocked provider test plus no-key fallback test |
+| AI actually browses the machine website | A bounded LangGraph loop reads one live agent page at a time, chooses an advertised transition, executes it through the mounted ASGI application, and returns an evidence-backed answer | End-to-end home → search → product → answer test with a scripted model |
+| Model output simulates UI interaction | AnyLLM returns a Pydantic-validated `follow`, `submit`, or `answer` decision; the executor rejects controls not present on the current page | Invalid-link/action and invalid-input tests |
 | Library-driven development | Each concern has a researched mature dependency/standard and a documented reason below | Dependency list and research ledger |
 | Never reinvent the wheel | Use UCP, RFC link/problem standards, JSON Schema, Python's mature parsers, PyMongo, Pydantic, AnyLLM, and FastAPI instead of custom protocol/parser/provider stacks | Code review against the library matrix |
 | Short, concise code and few files | Four clear runtime layers, centralized models/settings, one UI shell, no class hierarchy | File/function budget review |
@@ -145,6 +153,9 @@ All technical choices below were checked against current primary documentation o
 | Document/artifact persistence | [PyMongo](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/) and GridFS | Official MongoDB driver, bulk writes, indexes, stable document semantics, and managed original-source artifacts above the BSON document limit | Home-grown storage abstraction or lossy file-per-catalog outputs |
 | Mapping suggestions | [RapidFuzz](https://rapidfuzz.github.io/RapidFuzz/) | Fast deterministic field-name similarity using merchant-editable aliases | Generative mapping or custom edit-distance code |
 | Multi-provider models | [Mozilla AI `any-llm`](https://github.com/mozilla-ai/any-llm) | Required by the vision; unified typed interface backed by official provider SDKs | One wrapper per model vendor or a proxy dependency |
+| Agent control flow | [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) | Its low-level `StateGraph`, async nodes, and conditional edges directly model the bounded read/decide/navigate loop without imposing a tool-agent abstraction | A custom state machine, recursive coroutine, or provider-specific agent framework |
+| In-process website traversal | [HTTPX ASGI transport](https://www.python-httpx.org/advanced/transports/#asgi-transport) | Executes real HTTP requests against the mounted FastAPI application without loopback networking or route duplication | Calling catalog services behind the website's back or maintaining a fake page client |
+| Action input validation | [`jsonschema`](https://python-jsonschema.readthedocs.io/) | Validates model-supplied inputs against the exact schema advertised on the current page | Hand-written field/type validation |
 | HTTP/API tests | [pytest](https://docs.pytest.org/) and [HTTPX](https://www.python-httpx.org/) | Mature fixtures, parametrization, and ASGI transport support | Custom test runner/client |
 | Mongo tests | A uniquely named real test database, with [testcontainers](https://testcontainers-python.readthedocs.io/) as portable CI follow-up | Exercises actual BSON, indexes, bulk writes, and revision behavior; the available local Mongo enables the same path now | Depending on incomplete Mongo emulation for fidelity assertions |
 | Formatting/lint | [Ruff](https://docs.astral.sh/ruff/) | One fast mature tool for formatting and static lint checks | Custom style scripts or many overlapping tools |
@@ -215,7 +226,10 @@ Owns machine-first representations only. It produces profiled linked JSON pages 
 
 #### Model layer
 
-Owns one reusable AnyLLM client, provider configuration, bounded grounded context construction, and response extraction. It never parses source data or decides schema mappings.
+Owns one reusable AnyLLM client, Pydantic-validated browser decisions, bounded page memory,
+and the LangGraph agent-browser runtime. The runtime reaches catalog facts only through the
+mounted agent website. It never parses source data, queries catalog persistence, or decides
+schema mappings.
 
 #### Human UI
 
@@ -281,7 +295,8 @@ Environment-specific and secret values:
 - `ADMIN_API_KEY` (optional for local development, required for exposed deployments)
 - `MODEL_PROVIDER`
 - `MODEL_NAME`
-- provider-standard keys such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or others supported by AnyLLM
+- `MODEL_API_KEY`
+- `MODEL_API_BASE`
 
 The real `.env` stays ignored. `.env.example` contains names and safe local examples only.
 
@@ -509,6 +524,36 @@ Every UCP response is built/validated with `ucp-sdk` 0.5.x models for specificat
 
 FastAPI's OpenAPI remains available for developers and tests. It is supplementary: runtime links are the agent's navigation source. A future MCP adapter should expose pages as resources/templates and reserve tools for state-changing actions. A future A2A binding should advertise the same UCP capabilities rather than create a parallel catalog model.
 
+### 11.4 Built-in agent browser
+
+The human-facing chat demonstrates the canonical website model rather than a parallel RAG
+path:
+
+```text
+user goal
+    → open store home
+    → model reads current JSON page and bounded prior-page evidence
+    → model returns exactly one structured decision
+       ├── follow: an exact href advertised by the current page
+       ├── submit: a current action ID plus schema-valid inputs
+       └── answer: a grounded final response
+    → executor validates the decision and performs the HTTP transition
+    → repeat from the returned page
+```
+
+The executor uses HTTPX's ASGI transport against the real mounted FastAPI application. It
+does not call `CatalogService`, infer routes, or accept arbitrary model-generated URLs. A
+follow target must exactly match a top-level page link or entity `href`; a submitted action
+must exist on the current page; its inputs must pass the action's advertised JSON Schema; and
+every target must remain on the current storefront path and origin. Merchant data is always
+untrusted content, never control data.
+
+Runs are bounded by configured page-memory, history, timeout, and step limits. The response
+includes the final answer, exact record-page sources discovered during browsing, and a concise
+navigation trace. Without a model configuration, the same HTTP browser performs a deterministic
+home → search traversal and returns exact matches; it does not restore the direct-database
+chat shortcut.
+
 ## 12. Human dashboard and chatbot
 
 ### 12.1 Information architecture
@@ -537,13 +582,14 @@ Retain the best qualities of the existing UI while consolidating it:
 ### 12.3 Chat flow
 
 1. Validate the selected vendor and prompt.
-2. Run deterministic catalog search first.
-3. Build a bounded context containing only relevant records, their source labels, and navigation URLs.
-4. If AnyLLM is configured, send a system instruction plus untrusted catalog context and the user question.
-5. Return the answer with record references/agent URLs.
-6. If no provider/key is configured, return a deterministic result summary so the chatbot remains demonstrably useful.
+2. Open that vendor's public agent-site home page through the in-process ASGI transport.
+3. Give AnyLLM the current page, bounded previously visited page evidence, the user goal, and safe conversation history.
+4. Validate and execute one advertised `follow` or `submit` decision, then repeat from the returned page.
+5. Stop on a validated `answer` decision or the configured step limit.
+6. Return the answer with discovered record-page references and the navigation trace.
+7. If no provider/model is configured, traverse home → search deterministically and summarize exact returned entities.
 
-Catalog text is always treated as untrusted data, never executable instruction. API keys are read server-side from provider-standard environment names and never returned to the browser or stored in Mongo.
+Catalog text is always treated as untrusted data, never executable instruction. API keys are read server-side from the selected model configuration and never returned to the browser or stored in Mongo.
 
 ## 13. Management API
 
@@ -629,6 +675,11 @@ The API returns typed error bodies and correct 400/404/409/422/500 distinctions.
 - Sync status/counts are accurate.
 - No-key chat returns deterministic grounded results.
 - AnyLLM chat receives bounded context and returns normalized text.
+- Configured chat opens the agent home and reaches facts only through advertised page controls.
+- Model decisions are Pydantic-valid and cannot follow an unadvertised or cross-store URL.
+- Action submissions are rejected unless their inputs satisfy the current action's JSON Schema.
+- A multi-step scripted model can search, open at least two records, and return a comparison with record-page sources.
+- Step exhaustion ends with a best-evidence answer rather than an unbounded graph or raw exception.
 - Provider errors become safe actionable API errors.
 - Health and readiness distinguish process health from dependency readiness.
 
@@ -651,7 +702,7 @@ The first release is complete only when:
 4. a CSV, JSON, and multi-table SQLite source each synchronize losslessly;
 5. an agent can traverse linked JSON pages and search without OpenAPI/MCP knowledge;
 6. a mapped fixture passes UCP SDK validation for search and lookup;
-7. the dashboard shows real counts/state and chat works with and without a provider key;
+7. the dashboard chat itself uses a bounded model-directed home → action → page loop and works with and without a provider key;
 8. no secret, unrestricted path, fake authentication claim, or silent data loss remains.
 
 ## 17. Implementation sequence
@@ -683,18 +734,21 @@ The first release is complete only when:
 
 ### Phase 3 — agent-native website
 
-- [ ] Create and mount the inner FastAPI agent application.
-- [ ] Implement profiled JSON store/resource/search/record/schema pages.
-- [ ] Implement opaque cursor pagination and related-record navigation.
-- [ ] Implement UCP profile, catalog search, lookup, and product detail using the official SDK.
-- [ ] Add traversal, fidelity, pagination, and UCP validation tests.
+- [x] Create and mount the inner FastAPI agent application.
+- [x] Implement profiled JSON store/resource/search/record/schema pages.
+- [x] Implement opaque cursor pagination and related-record navigation.
+- [x] Implement UCP profile, catalog search, lookup, and product detail using the official SDK.
+- [x] Add traversal, fidelity, pagination, and UCP validation tests.
 
 ### Phase 4 — model layer and chat
 
-- [ ] Add the thin AnyLLM gateway with server-side provider configuration.
-- [ ] Implement deterministic retrieval and bounded grounding.
-- [ ] Implement provider and no-provider answer paths.
-- [ ] Test output extraction, citations/record links, and safe failures.
+- [x] Add the thin AnyLLM gateway with server-side provider configuration.
+- [x] Add a LangGraph state loop for model-directed agent-page traversal.
+- [x] Add Pydantic `follow`, `submit`, and `answer` decisions through AnyLLM structured output.
+- [x] Execute exact advertised controls through HTTPX's in-process ASGI transport.
+- [x] Remove the chat path's direct catalog retrieval and ground it in bounded visited pages.
+- [x] Implement provider and no-provider browser paths.
+- [x] Test multi-page decisions, citations/record links, invalid controls, step limits, and safe failures.
 
 ### Phase 5 — human control plane
 
@@ -705,11 +759,11 @@ The first release is complete only when:
 
 ### Phase 6 — final verification and delivery
 
-- [ ] Run Ruff formatting/lint checks.
-- [ ] Run the complete pytest suite and a real local Mongo smoke flow.
-- [ ] Start the production-style server and exercise health, sync, agent traversal, UCP, and chat endpoints.
-- [ ] Add a concise README and configuration reference.
-- [ ] Review the final tree against every row in the traceability table.
+- [x] Run Ruff formatting/lint checks.
+- [x] Run the complete pytest suite and a real local Mongo smoke flow.
+- [x] Start the production-style server and exercise health, sync, agent traversal, UCP, and chat endpoints.
+- [x] Add a concise README and configuration reference.
+- [x] Review the final tree against every row in the traceability table.
 - [ ] Prepare deployment packaging and publish only to a runtime that supports FastAPI plus Mongo configuration; do not replace FastAPI to fit a static host.
 
 ## 18. Evolution path after the first release
