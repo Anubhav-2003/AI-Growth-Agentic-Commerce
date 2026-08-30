@@ -9,7 +9,6 @@ from typing import Any
 from urllib.parse import quote
 
 import uvicorn
-from any_llm.exceptions import AnyLLMError
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -20,9 +19,9 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
-from agent_web import create_agent_app, encode_resource_name
+from agent_web import create_agent_app
 from config import Settings, get_settings
-from model_layer import ModelGateway
+from model_layer import AgentBrowser, AgentResponseError, ModelGateway
 from models import ChatRequest, MappingUpdate, Problem, VendorCreate, VendorPatch
 from services.catalog_service import CatalogService
 from services.normalization_service import NormalizationService
@@ -147,10 +146,10 @@ def create_app(
         """Return deterministic source and cursor validation failures as bad requests."""
         return _problem(request, 400, str(error))
 
-    @app.exception_handler(AnyLLMError)
-    async def model_error(request: Request, _error: AnyLLMError) -> JSONResponse:
-        """Report provider failure without revealing keys, prompts, or upstream payloads."""
-        return _problem(request, 502, "The configured model provider could not answer.")
+    @app.exception_handler(AgentResponseError)
+    async def agent_response_error(request: Request, _error: AgentResponseError) -> JSONResponse:
+        """Hide native provider failures and malformed decisions behind one safe boundary."""
+        return _problem(request, 502, "The configured model could not complete a browsing step.")
 
     @app.exception_handler(PyMongoError)
     async def mongo_error(request: Request, _error: PyMongoError) -> JSONResponse:
@@ -276,10 +275,7 @@ def create_app(
 
     @management.post("/vendors/{reference}/chat")
     async def chat(reference: str, payload: ChatRequest, request: Request) -> dict[str, Any]:
-        """Retrieve bounded records and answer through AnyLLM or its deterministic fallback.
-
-        Every returned citation links back to the exact machine-readable source record.
-        """
+        """Browse the live machine storefront and return its grounded answer and trace."""
         vendor = _vendor_or_404(catalog, reference)
         if len(payload.message) > config.limits.chat_question_characters:
             raise HTTPException(status_code=400, detail="The chat question is too long.")
@@ -289,28 +285,9 @@ def create_app(
             config.limits.chat_context_characters
         ):
             raise HTTPException(status_code=400, detail="The chat history is too large.")
-        mapping = vendor.get("mapping") or {}
-        result = catalog.list_records(
-            reference,
-            mapping.get("resource"),
-            query=payload.message,
-            limit=config.limits.chat_context_records,
-        )
-        records = result["items"]
-        answer, mode = await model.answer(payload.message, records, payload.history)
         root = str(request.base_url).rstrip("/")
-        sources = [
-            {
-                "label": f"{item['resource']}/{item['_id']}",
-                "href": (
-                    f"{root}{config.routes.agent}/{quote(str(vendor['slug']))}/resources/"
-                    f"{encode_resource_name(str(item['resource']))}/"
-                    f"{quote(str(item['_id']), safe='')}"
-                ),
-            }
-            for item in records
-        ]
-        return {"answer": answer, "mode": mode, "sources": sources}
+        entry = f"{root}{config.routes.agent}/{quote(str(vendor['slug']), safe='')}/"
+        return await request.app.state.agent_browser.run(payload.message, entry, payload.history)
 
     app.include_router(management)
     app.mount(
@@ -319,6 +296,7 @@ def create_app(
         name="static",
     )
     app.mount(config.routes.agent, create_agent_app(resolved, catalog), name="agent")
+    app.state.agent_browser = AgentBrowser(model, app, config)
     return app
 
 

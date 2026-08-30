@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -61,6 +61,30 @@ class ChatRequest(StrictModel):
 
     message: str = Field(min_length=1)
     history: list[dict[str, str]] = Field(default_factory=list)
+
+
+class BrowserDecision(StrictModel):
+    """Represent one exact machine-page transition or the final grounded answer."""
+
+    operation: Literal["follow", "submit", "answer"]
+    target: str | None = Field(default=None, description="Exact href or current action ID")
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    answer: str | None = None
+    citations: list[str] = Field(
+        default_factory=list, description="Exact encountered record hrefs supporting an answer"
+    )
+
+    @model_validator(mode="after")
+    def validate_operation_fields(self) -> "BrowserDecision":
+        """Require only the fields meaningful for the selected browser operation."""
+        if self.operation == "answer":
+            if not self.answer or self.target is not None or self.inputs:
+                raise ValueError("Answer decisions require only non-empty answer text.")
+        elif not self.target or self.answer is not None or self.citations:
+            raise ValueError("Navigation decisions require a target and no answer text.")
+        elif self.operation == "follow" and self.inputs:
+            raise ValueError("Follow decisions cannot include action inputs.")
+        return self
 
 
 class Link(BaseModel):
