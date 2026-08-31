@@ -56,7 +56,7 @@ Startup pings MongoDB and creates the required indexes. The process will not bec
 | `MODEL_API_KEY` | Server-side API key for the selected provider | blank |
 | `MODEL_API_BASE` | Optional provider-compatible API base | blank |
 
-Set `MODEL_PROVIDER`, `MODEL_NAME`, and `MODEL_API_KEY` to enable model chat. The key is passed only to AnyLLM on the server and is never exposed to the browser or stored in MongoDB. Provider-standard environment variables remain supported when the service process supplies them, but `MODEL_API_KEY` is the portable `.env` setting.
+Set `MODEL_PROVIDER`, `MODEL_NAME`, and `MODEL_API_KEY` to enable model chat. Startup loads `.env` into the process, so a manual `export` of that file is not required. `MODEL_API_KEY` is passed explicitly into AnyLLM. Provider-native names such as `GEMINI_API_KEY` also work after that load; prefer `MODEL_API_KEY` so every provider uses the same CommerceOS setting. The key is never exposed to the browser or stored in MongoDB.
 
 AnyLLM directly supports `gemini` and `groq`; model IDs stay configuration values so releases do not require source changes. As of 2026-08-30, Google lists `gemini-3.7-flash` as its latest stable Gemini model, and Groq lists `openai/gpt-oss-120b` as a current production model. Groq has deprecated Llama 3.3 70B for developer-tier use; use the provider's live model list when selecting an ID. See the [Gemini model guide](https://ai.google.dev/gemini-api/docs/models) and [Groq supported models](https://console.groq.com/docs/models).
 

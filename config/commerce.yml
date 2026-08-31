@@ -78,3 +78,4 @@ model:
     support the answer in citations. Write readable plain text without Markdown formatting.
   no_results: I could not find matching catalog records. Try a product name, category, brand, or attribute.
   deterministic_intro: "I found these matching catalog records:"
+  unavailable: The configured model could not complete a browsing step.

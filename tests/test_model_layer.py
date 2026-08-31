@@ -48,6 +48,58 @@ def _settings(
     )
 
 
+def test_unconfigured_gateway_skips_any_llm_and_stays_deterministic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Leave AnyLLM untouched when provider and model are both blank."""
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "model_layer.client.AnyLLM.create", lambda *_args, **_kwargs: calls.append(True)
+    )
+    gateway = ModelGateway(_settings(tmp_path), commerce_config)
+
+    assert gateway.configured is False
+    assert gateway.client is None
+    assert calls == []
+
+
+def test_create_failure_does_not_raise_and_blocks_deterministic_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Keep the process running when AnyLLM rejects construction, without a fake catalog answer."""
+
+    def create(_provider: str, **_options: Any) -> None:
+        """Stand in for a missing provider environment key without using a live SDK."""
+        raise RuntimeError("provider-secret-must-not-escape")
+
+    monkeypatch.setattr("model_layer.client.AnyLLM.create", create)
+    gateway = ModelGateway(
+        _settings(tmp_path, provider="gemini", model="gemini-3.6-flash"), commerce_config
+    )
+    app = FastAPI()
+
+    @app.get("/agent/shop/")
+    def home() -> dict[str, Any]:
+        """Give the browser a valid storefront page so failure is isolated to the model."""
+        return {
+            "page": {"id": "http://store.test/agent/shop/", "type": "store", "title": "Shop"},
+            "data": {},
+            "entities": [],
+            "links": [],
+            "actions": [],
+            "meta": {},
+        }
+
+    assert gateway.configured is True
+    assert gateway.client is None
+    with pytest.raises(AgentResponseError, match="could not complete"):
+        asyncio.run(
+            AgentBrowser(gateway, app, commerce_config).run(
+                "Find a lamp", "http://store.test/agent/shop/"
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypedDict
@@ -16,6 +17,8 @@ from pydantic import ValidationError
 
 from config import CommerceConfig, Settings
 from models import BrowserDecision
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AgentResponseError(RuntimeError):
@@ -55,18 +58,28 @@ class ModelGateway:
         self.config = config
         self.client = self._create_client()
 
+    @property
+    def configured(self) -> bool:
+        """True when operator selected a provider and model, even if the client failed."""
+        return bool(self.settings.model_provider and self.settings.model_name)
+
     def _create_client(self) -> AnyLLM | None:
-        """Create a provider only when both provider and model were configured."""
-        if not self.settings.model_provider or not self.settings.model_name:
+        """Create a provider from Settings. A missing key must not take down the process."""
+        if not self.configured:
             return None
-        options = (
-            {"api_key": self.settings.model_api_key.get_secret_value()}
-            if self.settings.model_api_key
-            else {}
-        )
+        options: dict[str, Any] = {}
+        if self.settings.model_api_key:
+            options["api_key"] = self.settings.model_api_key.get_secret_value()
         if self.settings.model_api_base:
             options["api_base"] = self.settings.model_api_base
-        return AnyLLM.create(self.settings.model_provider, **options)
+        try:
+            return AnyLLM.create(self.settings.model_provider, **options)
+        except Exception as error:
+            LOGGER.warning(
+                "AnyLLM provider client could not be created (%s)",
+                type(error).__name__,
+            )
+            return None
 
     async def decide(
         self,
@@ -80,7 +93,7 @@ class ModelGateway:
     ) -> BrowserDecision:
         """Ask AnyLLM for one schema-validated page transition or final answer."""
         if self.client is None:
-            raise AgentResponseError("A model is required for autonomous browsing.")
+            raise AgentResponseError(self.config.model.unavailable)
         context_limit = self.config.limits.chat_context_characters
         visited = self._page_excerpt(observations[:-1], context_limit // 2)
         current = self._page_excerpt(page, context_limit - len(visited))
@@ -213,6 +226,8 @@ class AgentBrowser:
             observation = {"url": url, "page": page}
             trace = [self._trace(0, "open", url, page)]
             if self.model.client is None:
+                if self.model.configured:
+                    raise AgentResponseError(self.config.model.unavailable)
                 return await self._deterministic(goal, page, observation, trace, context)
             state: BrowserState = {
                 "goal": goal,

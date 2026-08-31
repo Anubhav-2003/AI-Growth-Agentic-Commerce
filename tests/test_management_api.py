@@ -389,3 +389,43 @@ def test_optional_admin_api_key_protects_management_only(
     )
     with pytest.raises(RuntimeError, match="ADMIN_API_KEY"):
         create_app(production_without_key, mongo)
+
+
+def test_configured_model_construction_failure_returns_safe_chat_problem(
+    monkeypatch: pytest.MonkeyPatch,
+    integration_environment: tuple[Settings, MongoClient[dict[str, Any]], Path, str],
+) -> None:
+    """Keep chat usable as an API when AnyLLM cannot start, without leaking provider errors."""
+    settings, mongo, source_root, _ = integration_environment
+    source = _write_catalog(source_root)
+
+    def create(_provider: str, **_options: Any) -> None:
+        """Fail like a missing provider key without constructing a real client."""
+        raise RuntimeError("live-credential-must-not-appear")
+
+    monkeypatch.setattr("model_layer.client.AnyLLM.create", create)
+    configured = settings.model_copy(
+        update={"model_provider": "gemini", "model_name": "gemini-3.6-flash", "model_api_key": None}
+    )
+    with TestClient(create_app(configured, mongo), raise_server_exceptions=False) as http:
+        created = http.post(
+            "/api/vendors",
+            json={
+                "name": "Model Failure Store",
+                "slug": f"model-failure-{uuid4().hex[:8]}",
+                "source": {"kind": "csv", "path": str(source)},
+                "public": True,
+            },
+        )
+        assert created.status_code == 201
+        vendor_id = created.json()["vendor"]["_id"]
+        assert http.post(f"/api/vendors/{vendor_id}/sync").status_code == 200
+        response = http.post(
+            f"/api/vendors/{vendor_id}/chat", json={"message": "Moss Lamp", "history": []}
+        )
+        problem = _assert_problem(response, 502)
+        body = response.text.casefold()
+        assert problem["detail"] == settings.commerce.model.unavailable
+        assert "live-credential-must-not-appear" not in body
+        assert "runtimeerror" not in body
+        assert "traceback" not in body

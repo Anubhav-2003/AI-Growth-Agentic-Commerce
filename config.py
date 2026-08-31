@@ -2,6 +2,7 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -95,6 +96,7 @@ class ModelConfig(BaseModel):
     system_prompt: str
     no_results: str
     deterministic_intro: str
+    unavailable: str
 
 
 class CommerceConfig(BaseModel):
@@ -164,5 +166,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Reuse one immutable-by-convention settings instance per process."""
+    """Reuse one settings instance after loading `.env` into the process for libraries."""
+    load_dotenv()
     return Settings()  # type: ignore[call-arg]

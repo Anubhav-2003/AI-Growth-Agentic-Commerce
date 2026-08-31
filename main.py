@@ -149,7 +149,7 @@ def create_app(
     @app.exception_handler(AgentResponseError)
     async def agent_response_error(request: Request, _error: AgentResponseError) -> JSONResponse:
         """Hide native provider failures and malformed decisions behind one safe boundary."""
-        return _problem(request, 502, "The configured model could not complete a browsing step.")
+        return _problem(request, 502, config.model.unavailable)
 
     @app.exception_handler(PyMongoError)
     async def mongo_error(request: Request, _error: PyMongoError) -> JSONResponse:
