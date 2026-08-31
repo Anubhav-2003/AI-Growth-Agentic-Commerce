@@ -268,28 +268,30 @@
             </article>
           </section>
 
-          <section class="view" id="view-chat" data-page="chat" aria-labelledby="chat-title" hidden>
-            <div class="section-heading compact">
-              <div><p class="eyebrow">Storefront agent</p><h1 id="chat-title">Browse with an agent.</h1><p>The model enters the JSON storefront, follows its controls, and cites the record pages behind its answer.</p></div>
-              <span class="mode-chip" id="chat-mode">Website browser ready</span>
+          <section class="view chat-view" id="view-chat" data-page="chat" aria-labelledby="chat-title" hidden>
+            <div class="section-heading chat-heading">
+              <div><p class="eyebrow">Shopping assistant</p><h1 id="chat-title">Chat</h1></div>
+              <span class="mode-chip" id="chat-mode">Ready</span>
             </div>
             <div class="chat-layout">
               <section class="chat-panel" aria-label="Catalog conversation">
                 <div id="chat-log" class="chat-log" role="log" aria-live="polite" aria-relevant="additions"></div>
-                <div class="prompt-suggestions" id="prompt-suggestions" aria-label="Suggested questions">
-                  <button type="button">What products are available?</button>
-                  <button type="button">Show the strongest rated items</button>
-                  <button type="button">Which categories can I browse?</button>
+                <div class="chat-dock">
+                  <div class="prompt-suggestions" id="prompt-suggestions" aria-label="Suggested questions">
+                    <button type="button">What products are available?</button>
+                    <button type="button">What's the cheapest product?</button>
+                    <button type="button">Do you have anything for hiking?</button>
+                    <button type="button">Show me your best-rated products.</button>
+                  </div>
+                  <form id="chat-form" class="chat-form">
+                    <label class="sr-only" for="chat-input">Ask the store anything</label>
+                    <textarea id="chat-input" name="message" rows="1" maxlength="{{ chat_question_limit }}" placeholder="Ask the store anything…" required></textarea>
+                    <button class="send-button" id="chat-submit" type="submit" aria-label="Send message">↑</button>
+                  </form>
                 </div>
-                <form id="chat-form" class="chat-form">
-                  <label class="sr-only" for="chat-input">Ask a catalog question</label>
-                  <textarea id="chat-input" name="message" rows="1" maxlength="{{ chat_question_limit }}" placeholder="Ask about products, categories, prices, or source details…" required></textarea>
-                  <button class="send-button" id="chat-submit" type="submit" aria-label="Send message">↑</button>
-                </form>
-                <p class="chat-note">Catalog content is treated as untrusted data. Responses may be deterministic when no model provider is configured.</p>
               </section>
               <aside class="panel context-panel" aria-labelledby="context-title">
-                <p class="kicker">Current grounding</p><h2 id="context-title">Store context</h2>
+                <p class="kicker">Store</p><h2 id="context-title">Store context</h2>
                 <div id="chat-context" class="state-slot"></div>
               </aside>
             </div>

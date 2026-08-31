@@ -15,6 +15,7 @@ from pymongo import MongoClient
 
 from config import Settings, get_settings
 from main import create_app
+from model_layer.client import ProviderDecision
 from models import BrowserDecision
 
 _DATABASE_PREFIX = "commerceos_management_pytest_"
@@ -246,7 +247,9 @@ def test_vendor_sync_mapping_records_and_grounded_chat(
     assert len(answer["sources"]) == 1
     citation = answer["sources"][0]
     assert citation["label"].startswith(f"{source.stem}/")
+    assert citation["title"] == "Moss Lamp"
     assert citation["href"].startswith(f"http://testserver/agent/{slug}/resources/{source.stem}/")
+    assert "/agent/" not in answer["answer"]
     cited_page = client.get(citation["href"])
     assert cited_page.status_code == 200
     assert cited_page.json()["data"]["data"]["sku"] == "p-moss"
@@ -266,7 +269,7 @@ def test_vendor_sync_mapping_records_and_grounded_chat(
             page = json.loads(current)
             page_type = page["page"]["type"]
             visited.append(page_type)
-            assert kwargs["response_format"] is BrowserDecision
+            assert kwargs["response_format"] is ProviderDecision
             if page_type == "store":
                 decision = BrowserDecision(
                     operation="submit",
@@ -317,9 +320,12 @@ def test_vendor_sync_mapping_records_and_grounded_chat(
     agent_answer = agent_chat.json()
     assert agent_answer["mode"] == "agent"
     assert "$12.99" in agent_answer["answer"] and "$24.00" in agent_answer["answer"]
+    assert "/agent/" not in agent_answer["answer"]
     assert visited == ["store", "search-results", "record", "resource", "record"]
     assert [item["page_type"] for item in agent_answer["trace"]] == visited
     assert len(agent_answer["sources"]) == 2
+    assert {item["title"] for item in agent_answer["sources"]} == {"Moss Lamp", "Mint Mug"}
+    assert all("/agent/" in item["href"] for item in agent_answer["sources"])
     assert all(client.get(item["href"]).status_code == 200 for item in agent_answer["sources"])
 
     final_detail = client.get(f"/api/vendors/{vendor_id}").json()

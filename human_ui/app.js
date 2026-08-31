@@ -154,8 +154,10 @@ function showState(container, title, detail, actionLabel, action, isError = fals
 
 // Surface a transient result while keeping inline view states intact.
 function notify(message, kind = "success") {
+  const text = String(message || "").trim();
+  if (!text) return;
   const notice = byId("global-notice");
-  byId("global-notice-text").textContent = message;
+  byId("global-notice-text").textContent = text;
   notice.className = `global-notice${kind === "error" ? " is-error" : kind === "warning" ? " is-warning" : ""}`;
   notice.hidden = false;
   window.clearTimeout(notify.timer);
@@ -759,43 +761,58 @@ function chooseAgentDocument(event) {
 }
 
 // Render an initial chat prompt or the complete safe conversation log.
+function sourceTitle(source) {
+  const title = String(source?.title || "").trim();
+  const label = String(source?.label || "").trim();
+  const opaque = /^[\w-]+\/[a-f0-9]{8,}/i;
+  if (title && !opaque.test(title)) return title;
+  if (label && !opaque.test(label)) return label;
+  return "View product";
+}
+
 function renderChat() {
   const log = byId("chat-log");
+  const suggestions = byId("prompt-suggestions");
   log.replaceChildren();
+  suggestions.hidden = Boolean(state.chat.length || state.chatPending);
   if (!state.chat.length && !state.chatPending) {
     const empty = make("div", "chat-empty");
-    empty.append(make("span", "chat-glyph", "✦"), make("h2", "", state.vendor ? `Ask about ${state.vendor.name || "this catalog"}` : "Select a storefront first"), make("p", "", `${settings.appName} enters the machine storefront, follows its live controls, and returns the pages that support the answer.`));
+    const store = state.vendor?.name || "this store";
+    empty.append(
+      make("span", "chat-glyph", "✦"),
+      make("h2", "", state.vendor ? `Ask about ${store}` : "Select a storefront first"),
+      make("p", "", state.vendor ? `Ask about products, prices, or recommendations. ${settings.appName} will browse the store and answer from what it finds.` : "Choose a storefront to start a conversation.")
+    );
     log.append(empty);
   }
   for (const message of state.chat) {
-    const item = make("article", `chat-message is-${message.role === "user" ? "user" : "assistant"}`);
-    item.append(make("span", "chat-message-label", message.role === "user" ? "You" : `${settings.appName}${message.mode ? ` · ${message.mode}` : ""}`), make("div", "chat-bubble", message.content));
+    const item = make("article", `chat-message is-${message.role === "user" ? "user" : "assistant"}${message.mode === "error" ? " is-error" : ""}`);
+    item.append(
+      make("span", "chat-message-label", message.role === "user" ? "You" : settings.appName),
+      make("div", "chat-bubble", message.content)
+    );
     if (message.sources?.length) {
       const sources = make("div", "chat-sources");
       for (const source of message.sources) {
         const href = safeUrl(source.url || source.href || source.agent_url);
         if (!href) continue;
-        const link = make("a", "", source.title || source.label || source.id || "Open source record");
+        const link = make("a", "chat-source");
         link.href = href;
         link.target = "_blank";
         link.rel = "noopener";
+        link.append(make("strong", "", sourceTitle(source)), make("span", "", "View product →"));
         sources.append(link);
       }
       item.append(sources);
-    }
-    if (message.trace?.length) {
-      const trace = make("div", "chat-trace");
-      for (const step of message.trace) trace.append(make("span", "", `${step.operation} · ${step.title || step.page_type || "page"}`));
-      item.append(trace);
     }
     log.append(item);
   }
   if (state.chatPending) {
     const item = make("article", "chat-message is-assistant");
     const dots = make("div", "typing");
-    dots.setAttribute("aria-label", `${settings.appName} is browsing the machine storefront`);
+    dots.setAttribute("aria-label", `${settings.appName} is writing`);
     dots.append(make("span"), make("span"), make("span"));
-    item.append(make("span", "chat-message-label", `${settings.appName} · browsing`), dots);
+    item.append(make("span", "chat-message-label", settings.appName), dots);
     log.append(item);
   }
   byId("chat-input").disabled = !state.vendor || state.chatPending;
@@ -835,7 +852,7 @@ async function sendChat(event) {
   try {
     const result = await fetchJson(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/chat`), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, history }) });
     state.chat.push({ role: "assistant", content: result?.answer || "No grounded answer was returned.", mode: result?.mode || "grounded", sources: result?.sources || [], trace: result?.trace || [] });
-    byId("chat-mode").textContent = result?.mode === "agent" ? "Agent · website traversal" : "Deterministic website search";
+    byId("chat-mode").textContent = result?.mode === "agent" || result?.mode === "deterministic" ? "In conversation" : "Ready";
   } catch (error) {
     state.chat.push({ role: "assistant", content: `I could not retrieve a grounded answer: ${error.message}`, mode: "error", sources: [] });
   } finally {

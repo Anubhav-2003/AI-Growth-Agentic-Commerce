@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import httpx
@@ -13,12 +13,49 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from config import CommerceConfig, Settings
 from models import BrowserDecision
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ProviderDecision(BaseModel):
+    """Capture provider JSON before CommerceOS XOR rules run.
+
+    AnyLLM validates ``response_format`` itself. Passing ``BrowserDecision`` there
+    rejects recoverable navigation extras (null inputs, citations on follow) before
+    application code can run. This envelope is not the public decision contract.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    operation: Literal["follow", "submit", "answer"]
+    target: str | None = None
+    inputs: dict[str, Any] | None = None
+    answer: str | None = None
+    citations: list[str] | None = None
+
+
+def _human_title(item: Mapping[str, Any], aliases: Sequence[str]) -> str | None:
+    """Prefer projected or source display names over opaque record identifiers."""
+    commerce = item.get("commerce") if isinstance(item.get("commerce"), Mapping) else {}
+    title = str(commerce.get("title") or "").strip()
+    if title:
+        return title
+    data = item.get("data") if isinstance(item.get("data"), Mapping) else item
+    if isinstance(data, Mapping):
+        for key in aliases:
+            value = data.get(key)
+            if value is not None and not isinstance(value, (dict, list, bytes)):
+                text = str(value).strip()
+                if text:
+                    return text
+    identity = item.get("page") if isinstance(item.get("page"), Mapping) else {}
+    fallback = str(identity.get("title") or "").strip()
+    identifier = str(item.get("_id") or item.get("id") or "")
+    return fallback if fallback and fallback != identifier else None
 
 
 class AgentResponseError(RuntimeError):
@@ -101,7 +138,12 @@ class ModelGateway:
             "The navigation limit is reached. Return operation=answer now using the best "
             "visited evidence; do not request another transition."
             if force_answer
-            else "Choose one current-page transition, or answer if the evidence is sufficient."
+            else (
+                "If visited pages already contain the facts needed for the user's question, "
+                "return operation=answer with shopper text and optional record-href citations. "
+                "Otherwise choose one follow or submit with a required target and without "
+                "answer text or citations."
+            )
         )
         feedback = f"\n<navigation-feedback>{error}</navigation-feedback>" if error else ""
         prompt = (
@@ -117,10 +159,11 @@ class ModelGateway:
                     *self._safe_history(history),
                     {"role": "user", "content": prompt},
                 ],
-                response_format=BrowserDecision,
+                response_format=ProviderDecision,
                 timeout=self.config.limits.model_timeout_seconds,
             )
         except Exception as error:
+            LOGGER.exception("Model decision failed: %s", type(error).__name__)
             raise AgentResponseError(
                 "The model provider could not choose a page action."
             ) from error
@@ -147,27 +190,78 @@ class ModelGateway:
 
     def _summarize(self, records: list[dict[str, Any]]) -> str:
         """Return useful exact matches when no model credentials are available."""
+        aliases = self.config.mapping.aliases.get("title", ("title", "name"))
         lines = [self.config.model.deterministic_intro]
         for record in records[: self.config.limits.chat_context_records]:
             data = record.get("data", record)
-            values = [str(value) for value in data.values() if self._is_scalar(value)]
-            identifier = record.get("_id", record.get("id"))
-            label = record.get("label") or f"{record.get('resource', 'record')}/{identifier}"
-            lines.append(f"[{label}] {' · '.join(values[:5])}")
+            name = _human_title(record, aliases) or "Catalog record"
+            values = [
+                str(value)
+                for value in (data.values() if isinstance(data, Mapping) else [])
+                if self._is_scalar(value) and str(value).strip() != name
+            ]
+            detail = " · ".join(values[:4])
+            lines.append(f"{name} · {detail}" if detail else name)
         return "\n".join(lines)
 
     @staticmethod
-    def _decision(response: Any) -> BrowserDecision:
-        """Prefer provider-parsed output and validate textual JSON as a portable fallback."""
+    def _provider_payload(response: Any) -> Any:
+        """Read AnyLLM parsed output or textual JSON without trusting extra provider keys."""
         message = response.choices[0].message
         parsed = getattr(message, "parsed", None)
-        if isinstance(parsed, BrowserDecision):
+        if parsed is not None:
             return parsed
+        content = ModelGateway._content(response)
+        return json.loads(content) if content else {}
+
+    @staticmethod
+    def _recover_navigation(payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Drop only harmless extras on follow/submit; never invent a target or discard answers."""
+        recovered = {
+            key: payload[key]
+            for key in ("operation", "target", "inputs", "answer", "citations")
+            if key in payload
+        }
+        if recovered.get("citations") is None:
+            recovered["citations"] = []
+        if recovered.get("operation") not in {"follow", "submit"}:
+            if recovered.get("inputs") is None:
+                recovered["inputs"] = {}
+            return recovered
+        answer = recovered.get("answer")
+        if isinstance(answer, str) and not answer.strip():
+            answer = None
+        if answer is not None:
+            return recovered
+        recovered["answer"] = None
+        recovered["citations"] = []
+        if recovered.get("inputs") is None:
+            recovered["inputs"] = {}
+        return recovered
+
+    @staticmethod
+    def _decision(response: Any) -> BrowserDecision:
+        """Normalize provider JSON, then enforce the public BrowserDecision XOR contract."""
         try:
-            if parsed is not None:
-                return BrowserDecision.model_validate(parsed)
-            return BrowserDecision.model_validate_json(ModelGateway._content(response))
-        except (TypeError, ValueError, ValidationError) as error:
+            parsed = ModelGateway._provider_payload(response)
+            if isinstance(parsed, BrowserDecision):
+                return parsed
+            if isinstance(parsed, ProviderDecision):
+                parsed = parsed.model_dump()
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+            if not isinstance(parsed, Mapping):
+                raise TypeError("The model returned an invalid browser decision.")
+            return BrowserDecision.model_validate(ModelGateway._recover_navigation(parsed))
+        except (TypeError, ValueError, ValidationError, json.JSONDecodeError) as error:
+            summary: Any = type(error).__name__
+            if isinstance(error, ValidationError):
+                summary = error.errors(
+                    include_url=False, include_input=False, include_context=False
+                )
+            LOGGER.warning(
+                "BrowserDecision validation failed: %s %s", type(error).__name__, summary
+            )
             raise AgentResponseError("The model returned an invalid browser decision.") from error
 
     @staticmethod
@@ -396,10 +490,11 @@ class AgentBrowser:
             }
             for item in entities
         ]
+        matched = [str(item["href"]) for item in entities if item.get("href")]
         return {
             "answer": self.model._summarize(records) if records else self.config.model.no_results,
             "mode": "deterministic",
-            "sources": self._sources(observations),
+            "sources": self._sources(observations, matched),
             "trace": [*trace, self._trace(1, "submit", url, page)],
         }
 
@@ -424,28 +519,32 @@ class AgentBrowser:
     def _sources(
         self, observations: list[dict[str, Any]], selected: list[str] | None = None
     ) -> list[dict[str, str]]:
-        """Collect unique exact record pages encountered during navigation."""
+        """Prefer cited or opened records; do not promote incidental list/search entities."""
+        aliases = self.config.mapping.aliases.get("title", ("title", "name"))
         found: dict[str, dict[str, str]] = {}
         opened: set[str] = set()
         for observation in observations:
             page, url = observation["page"], str(observation["url"])
             identity = page.get("page", {})
             if identity.get("type") == "record":
-                record = page.get("data", {})
+                record = page.get("data", {}) if isinstance(page.get("data"), Mapping) else {}
                 label = (
                     f"{record.get('resource', 'record')}/{record.get('_id', identity.get('title'))}"
                 )
-                found[url] = {"label": label, "href": url}
+                title = _human_title({**record, "page": identity}, aliases) or identity.get("title")
+                found[url] = {"label": label, "href": url, "title": str(title or label)}
                 opened.add(url)
             for item in page.get("entities", []):
                 if isinstance(item, Mapping) and item.get("type") == "record" and item.get("href"):
                     href = str(item["href"])
+                    label = f"{item.get('resource', 'record')}/{item.get('id', '')}"
                     found[href] = {
-                        "label": f"{item.get('resource', 'record')}/{item.get('id', '')}",
+                        "label": label,
                         "href": href,
+                        "title": str(_human_title(item, aliases) or label),
                     }
         requested = [href for href in selected or [] if href in found]
-        preferred = requested or [href for href in found if href in opened] or list(found)
+        preferred = requested or [href for href in found if href in opened]
         return [found[href] for href in dict.fromkeys(preferred)][
             : self.config.limits.chat_context_records
         ]
