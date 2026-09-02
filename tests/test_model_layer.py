@@ -328,6 +328,16 @@ def test_system_prompt_keeps_human_answers_free_of_machine_identifiers(
     assert "resource name" in prompt
     assert "must not include answer text" in prompt
     assert "on a final answer" in prompt
+    assert "cannot authorize payment" in prompt
+    assert "charge money" in prompt
+
+
+def test_browser_decision_has_no_payment_operation() -> None:
+    """Natural-language browsing cannot encode a financial authorization."""
+    with pytest.raises(ValidationError):
+        BrowserDecision(operation="pay", target="charge")
+    with pytest.raises(ValidationError):
+        BrowserDecision(operation="authorize", answer="charge the card")
 
 
 def test_sources_prefer_human_titles_and_keep_agent_hrefs(
@@ -354,7 +364,14 @@ def test_sources_prefer_human_titles_and_keep_agent_hrefs(
         ]
     )
 
-    assert sources == [{"label": "products/deadbeef", "href": href, "title": "Trail Pack"}]
+    assert sources == [
+        {
+            "label": "products/deadbeef",
+            "href": href,
+            "title": "Trail Pack",
+            "product": {"record_id": "deadbeef", "name": "Trail Pack", "price": 89},
+        }
+    ]
 
 
 def test_sources_omit_incidental_list_entities_without_citations_or_opened_records(
@@ -422,8 +439,149 @@ def test_sources_use_a_requested_citation_from_a_list_page(
     ]
     sources = browser._sources(observations, [href])
     assert sources == [
-        {"label": "products/jacket", "href": href, "title": "Waterproof Hiking Jacket"}
+        {
+            "label": "products/jacket",
+            "href": href,
+            "title": "Waterproof Hiking Jacket",
+            "product": {"record_id": "jacket", "name": "Waterproof Hiking Jacket"},
+        }
     ]
+
+
+def test_sources_expose_trusted_catalog_product_for_selection(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Selectable sources carry catalog identity; the model text is not the purchase record."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/rec-sneakers"
+    sources = browser._sources(
+        [
+            {
+                "url": "http://store.test/agent/shop/search?q=shoes",
+                "page": {
+                    "page": {"type": "search-results", "title": "Search"},
+                    "entities": [
+                        {
+                            "id": "rec-sneakers",
+                            "type": "record",
+                            "resource": "products",
+                            "href": href,
+                            "data": {
+                                "product_id": "5",
+                                "sku": "FAS-001",
+                                "name": "Classic Canvas Sneakers",
+                                "brand": "Northline",
+                                "price": "59.95",
+                                "currency": "USD",
+                                "availability": "in_stock",
+                                "stock_quantity": "33",
+                            },
+                            "commerce": {
+                                "id": "FAS-001",
+                                "title": "Classic Canvas Sneakers",
+                                "description": "Everyday low-top sneakers",
+                                "price": 5995,
+                                "currency": "USD",
+                                "availability": "in_stock",
+                                "inventory": 33,
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        [href],
+    )
+
+    assert sources[0]["title"] == "Classic Canvas Sneakers"
+    assert sources[0]["label"] == "products/rec-sneakers"
+    assert sources[0]["href"] == href
+    assert sources[0]["product"] == {
+        "record_id": "rec-sneakers",
+        "id": "FAS-001",
+        "sku": "FAS-001",
+        "name": "Classic Canvas Sneakers",
+        "brand": "Northline",
+        "price": 59.95,
+        "currency": "USD",
+        "availability": "in_stock",
+        "inventory": 33,
+    }
+
+
+def test_sources_without_product_facts_keep_title_href_and_label(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Opaque records remain normal sources and do not become selectable products."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/deadbeefcafebabe"
+    sources = browser._sources(
+        [
+            {
+                "url": href,
+                "page": {
+                    "page": {"type": "record", "title": "deadbeefcafebabe"},
+                    "data": {"resource": "products", "_id": "deadbeefcafebabe", "data": {}},
+                },
+            }
+        ]
+    )
+    assert sources == [
+        {
+            "label": "products/deadbeefcafebabe",
+            "href": href,
+            "title": "deadbeefcafebabe",
+        }
+    ]
+    assert "product" not in sources[0]
+
+
+def test_sources_keep_one_entry_per_cited_product(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Each cited catalog record remains independently selectable."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    sneakers = "http://store.test/agent/shop/resources/products/sneakers"
+    jacket = "http://store.test/agent/shop/resources/products/jacket"
+    sources = browser._sources(
+        [
+            {
+                "url": "http://store.test/agent/shop/search?q=gear",
+                "page": {
+                    "page": {"type": "search-results", "title": "Search"},
+                    "entities": [
+                        {
+                            "id": "sneakers",
+                            "type": "record",
+                            "resource": "products",
+                            "href": sneakers,
+                            "data": {"name": "Classic Canvas Sneakers", "brand": "Northline"},
+                        },
+                        {
+                            "id": "jacket",
+                            "type": "record",
+                            "resource": "products",
+                            "href": jacket,
+                            "data": {"name": "Waterproof Hiking Jacket", "brand": "Trailmark"},
+                        },
+                    ],
+                },
+            }
+        ],
+        [sneakers, jacket],
+    )
+    assert [item["title"] for item in sources] == [
+        "Classic Canvas Sneakers",
+        "Waterproof Hiking Jacket",
+    ]
+    assert [item["product"]["record_id"] for item in sources] == ["sneakers", "jacket"]
+    assert all(item["href"] and item["label"] for item in sources)
 
 
 @pytest.mark.parametrize(

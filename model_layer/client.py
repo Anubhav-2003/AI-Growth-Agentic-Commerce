@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
@@ -38,20 +39,143 @@ class ProviderDecision(BaseModel):
     citations: list[str] | None = None
 
 
+def _unwrap_scalar(value: Any) -> Any:
+    """Read a stored scalar, including the reversible numeric wrappers used in catalogs."""
+    if isinstance(value, Mapping) and value.get("$commerceos_type") in {
+        "decimal",
+        "integer",
+        "float",
+    }:
+        return value.get("value")
+    return value
+
+
+def _first_scalar(data: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    """Return the first non-empty scalar for an alias list without inventing values."""
+    for key in keys:
+        value = _unwrap_scalar(data.get(key))
+        if value is not None and not isinstance(value, (dict, list, bytes, bool)):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _major_amount(value: Any, *, minor: bool = False) -> int | float | None:
+    """Expose a catalog price in major units when the stored amount is finite and labeled."""
+    raw = _unwrap_scalar(value)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        amount = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+    if minor:
+        amount = amount / Decimal("100")
+    if not amount.is_finite() or amount < 0:
+        return None
+    return int(amount) if amount == amount.to_integral_value() else float(amount)
+
+
+def _catalog_layers(
+    item: Mapping[str, Any],
+) -> tuple[str, Mapping[str, Any], Mapping[str, Any]]:
+    """Split record identity, source fields, and projection from either agent-page shape."""
+    nested = item.get("data") if isinstance(item.get("data"), Mapping) else {}
+    envelope = any(key in item for key in ("_id", "sync_id", "relationships")) and "data" in item
+    if envelope:
+        commerce = item.get("commerce") if isinstance(item.get("commerce"), Mapping) else {}
+        return str(item.get("_id") or ""), nested, commerce
+    if isinstance(nested, Mapping) and any(
+        key in nested for key in ("_id", "sync_id", "relationships")
+    ):
+        source = nested.get("data") if isinstance(nested.get("data"), Mapping) else {}
+        commerce = (
+            nested.get("commerce")
+            if isinstance(nested.get("commerce"), Mapping)
+            else item.get("commerce")
+            if isinstance(item.get("commerce"), Mapping)
+            else {}
+        )
+        return str(nested.get("_id") or item.get("id") or ""), source, commerce
+    commerce = item.get("commerce") if isinstance(item.get("commerce"), Mapping) else {}
+    return str(item.get("id") or item.get("_id") or ""), nested, commerce
+
+
+def _catalog_product(
+    item: Mapping[str, Any], aliases: Mapping[str, Sequence[str]]
+) -> dict[str, Any] | None:
+    """Copy selectable product facts from catalog pages; never from model-generated text."""
+    record_id, source, commerce = _catalog_layers(item)
+    name = str(commerce.get("title") or "").strip() or _first_scalar(
+        source, aliases.get("title", ())
+    )
+    if not record_id or not name or name == record_id:
+        return None
+    product: dict[str, Any] = {"record_id": record_id, "name": name}
+    mapped = str(commerce.get("id") or "").strip() or _first_scalar(source, aliases.get("id", ()))
+    if mapped and mapped != record_id:
+        product["id"] = mapped
+    sku = _first_scalar(source, ("sku",))
+    if sku:
+        product["sku"] = sku
+    brand = str(commerce.get("brand") or "").strip() or _first_scalar(
+        source, aliases.get("brand", ())
+    )
+    if brand:
+        product["brand"] = brand
+    if "price" in commerce:
+        price = _major_amount(commerce.get("price"), minor=True)
+    else:
+        price = _major_amount(source.get("price"))
+        if price is None:
+            price = _major_amount(_first_scalar(source, aliases.get("price", ())))
+    if price is not None:
+        product["price"] = price
+    currency = str(commerce.get("currency") or "").strip() or _first_scalar(
+        source, aliases.get("currency", ())
+    )
+    if currency:
+        product["currency"] = currency.upper()
+    availability = str(commerce.get("availability") or "").strip() or _first_scalar(
+        source, aliases.get("availability", ())
+    )
+    if availability:
+        product["availability"] = availability
+    stock = commerce.get("inventory")
+    if stock is None:
+        stock = source.get("inventory")
+        if stock is None:
+            stock = _first_scalar(source, aliases.get("inventory", ()))
+    count = _integer_count(stock)
+    if count is not None:
+        product["inventory"] = count
+    return product
+
+
+def _integer_count(value: Any) -> int | None:
+    """Read a catalog stock count without treating selection as inventory mutation."""
+    raw = _unwrap_scalar(value)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        amount = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return None
+    if amount.is_finite() and amount >= 0 and amount == amount.to_integral_value():
+        return int(amount)
+    return None
+
+
 def _human_title(item: Mapping[str, Any], aliases: Sequence[str]) -> str | None:
     """Prefer projected or source display names over opaque record identifiers."""
-    commerce = item.get("commerce") if isinstance(item.get("commerce"), Mapping) else {}
+    _, source, commerce = _catalog_layers(item)
     title = str(commerce.get("title") or "").strip()
     if title:
         return title
-    data = item.get("data") if isinstance(item.get("data"), Mapping) else item
-    if isinstance(data, Mapping):
-        for key in aliases:
-            value = data.get(key)
-            if value is not None and not isinstance(value, (dict, list, bytes)):
-                text = str(value).strip()
-                if text:
-                    return text
+    named = _first_scalar(source, aliases)
+    if named:
+        return named
     identity = item.get("page") if isinstance(item.get("page"), Mapping) else {}
     fallback = str(identity.get("title") or "").strip()
     identifier = str(item.get("_id") or item.get("id") or "")
@@ -516,12 +640,22 @@ class AgentBrowser:
                 records.append(dict(page.get("data") or {}))
         return self.model._summarize(records) if records else self.config.model.no_results
 
+    def _source_entry(
+        self, href: str, label: str, item: Mapping[str, Any], title: str
+    ) -> dict[str, Any]:
+        """Keep title/label/href and attach catalog product facts when a record is selectable."""
+        source: dict[str, Any] = {"label": label, "href": href, "title": title}
+        product = _catalog_product(item, self.config.mapping.aliases)
+        if product:
+            source["product"] = product
+        return source
+
     def _sources(
         self, observations: list[dict[str, Any]], selected: list[str] | None = None
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Prefer cited or opened records; do not promote incidental list/search entities."""
         aliases = self.config.mapping.aliases.get("title", ("title", "name"))
-        found: dict[str, dict[str, str]] = {}
+        found: dict[str, dict[str, Any]] = {}
         opened: set[str] = set()
         for observation in observations:
             page, url = observation["page"], str(observation["url"])
@@ -532,17 +666,15 @@ class AgentBrowser:
                     f"{record.get('resource', 'record')}/{record.get('_id', identity.get('title'))}"
                 )
                 title = _human_title({**record, "page": identity}, aliases) or identity.get("title")
-                found[url] = {"label": label, "href": url, "title": str(title or label)}
+                found[url] = self._source_entry(url, label, record, str(title or label))
                 opened.add(url)
             for item in page.get("entities", []):
                 if isinstance(item, Mapping) and item.get("type") == "record" and item.get("href"):
                     href = str(item["href"])
                     label = f"{item.get('resource', 'record')}/{item.get('id', '')}"
-                    found[href] = {
-                        "label": label,
-                        "href": href,
-                        "title": str(_human_title(item, aliases) or label),
-                    }
+                    found[href] = self._source_entry(
+                        href, label, item, str(_human_title(item, aliases) or label)
+                    )
         requested = [href for href in selected or [] if href in found]
         preferred = requested or [href for href in found if href in opened]
         return [found[href] for href in dict.fromkeys(preferred)][

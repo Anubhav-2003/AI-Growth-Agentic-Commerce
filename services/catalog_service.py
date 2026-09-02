@@ -74,6 +74,31 @@ def _minor_price(value: Any, units: str | None) -> int | None:
     )
 
 
+def _count(value: Any) -> int | None:
+    """Read a non-negative whole stock count without mutating catalog inventory."""
+    if isinstance(value, Mapping) and value.get("$commerceos_type") in {
+        "decimal",
+        "integer",
+        "float",
+    }:
+        value = value.get("value")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if amount.is_finite() and amount >= 0 and amount == amount.to_integral_value():
+        return int(amount)
+    return None
+
+
+def _major_units(minor: int) -> int | float:
+    """Convert stored minor units into a shopper-facing major amount."""
+    amount = Decimal(minor) / _MINOR_PER_MAJOR
+    return int(amount) if amount == amount.to_integral() else float(amount)
+
+
 class CatalogService:
     """Keep Mongo persistence, catalog queries, and deterministic projections together."""
 
@@ -85,6 +110,7 @@ class CatalogService:
         self.resources = database[names.resources]
         self.records = database[names.records]
         self.syncs = database[names.syncs]
+        self.purchases = database[names.purchases]
         self.artifact_bucket_name = f"{names.syncs}_artifacts"
         self.artifacts = GridFSBucket(database, bucket_name=self.artifact_bucket_name)
 
@@ -125,6 +151,12 @@ class CatalogService:
             [
                 IndexModel("sync_id", unique=True),
                 IndexModel([("vendor_id", ASCENDING), ("started_at", DESCENDING)]),
+            ]
+        )
+        self.purchases.create_indexes(
+            [
+                IndexModel("attempt_id", unique=True),
+                IndexModel([("vendor_id", ASCENDING), ("created_at", DESCENDING)]),
             ]
         )
         self.database[f"{self.artifact_bucket_name}.files"].create_index(
@@ -218,7 +250,7 @@ class CatalogService:
             {"metadata.vendor_id": key}
         ):
             self.artifacts.delete(file["_id"])
-        for collection in (self.resources, self.records, self.syncs):
+        for collection in (self.resources, self.records, self.syncs, self.purchases):
             collection.delete_many({"vendor_id": key})
         return self.vendors.delete_one({"_id": key}).deleted_count == 1
 
@@ -289,6 +321,274 @@ class CatalogService:
         }
         document = self.records.find_one(query)
         return self._record_view(document) if document else None
+
+    def review_purchase(self, reference: VendorReference, items: Any) -> Document:
+        """Validate current catalog offers and record a review without starting payment."""
+        return self._store_purchase(reference, items, status="review")
+
+    def authorize_purchase(
+        self, reference: VendorReference, attempt_id: str, confirm: bool
+    ) -> Document:
+        """Re-validate catalog facts after an explicit confirmation; never charge here."""
+        if confirm is not True:
+            raise ValueError("Explicit purchase confirmation is required before payment.")
+        vendor, document = self._purchase_document(reference, attempt_id)
+        if document["status"] == "cancelled":
+            raise ValueError("This purchase was cancelled and cannot continue to payment.")
+        if document["status"] not in {"review", "authorized"}:
+            raise ValueError("This purchase cannot be authorized.")
+        lines = self._validated_lines(
+            vendor,
+            [
+                {"record_id": item["record_id"], "quantity": item["quantity"]}
+                for item in document["items"]
+            ],
+        )
+        previous = {item["record_id"]: item for item in document["items"]}
+        for line in lines:
+            shown = previous.get(line["record_id"], {}).get("displayed_price_minor")
+            if shown is not None:
+                line["displayed_price_minor"] = shown
+        now = datetime.now(UTC)
+        updates = {
+            "status": "authorized",
+            "items": lines,
+            "total_minor": sum(item["subtotal_minor"] for item in lines),
+            "currency": lines[0]["currency"],
+            "authorized_at": document.get("authorized_at") or now,
+            "updated_at": now,
+            "payment": self._payment_state(),
+        }
+        self.purchases.update_one({"_id": document["_id"]}, {"$set": updates})
+        return self._purchase_view({**document, **updates})
+
+    def cancel_purchase(self, reference: VendorReference, attempt_id: str) -> Document:
+        """Close a purchase attempt without payment or inventory mutation."""
+        _, document = self._purchase_document(reference, attempt_id)
+        if document["status"] == "cancelled":
+            return self._purchase_view(document)
+        now = datetime.now(UTC)
+        updates = {
+            "status": "cancelled",
+            "cancelled_at": now,
+            "updated_at": now,
+            "payment": self._payment_state(),
+        }
+        self.purchases.update_one({"_id": document["_id"]}, {"$set": updates})
+        return self._purchase_view({**document, **updates})
+
+    def _store_purchase(self, reference: VendorReference, items: Any, status: str) -> Document:
+        """Persist one auditable purchase attempt after live catalog validation."""
+        vendor = self._find_vendor(reference)
+        if not vendor or not vendor.get("active_sync_id"):
+            raise FileNotFoundError("The requested storefront was not found.")
+        lines = self._validated_lines(vendor, items)
+        now = datetime.now(UTC)
+        document = {
+            "attempt_id": uuid4().hex,
+            "vendor_id": vendor["_id"],
+            "status": status,
+            "items": lines,
+            "total_minor": sum(item["subtotal_minor"] for item in lines),
+            "currency": lines[0]["currency"],
+            "created_at": now,
+            "updated_at": now,
+            "authorized_at": None,
+            "cancelled_at": None,
+            "payment": self._payment_state(),
+        }
+        self.purchases.insert_one(document)
+        return self._purchase_view(document)
+
+    def _validated_lines(self, vendor: Document, items: Any) -> list[Document]:
+        """Rebuild every line from canonical record IDs and current catalog facts."""
+        requested = [_payload(item) for item in items]
+        if not requested:
+            raise ValueError("Select at least one product before continuing to purchase.")
+        seen: set[str] = set()
+        lines: list[Document] = []
+        currency = None
+        for item in requested:
+            record_id = str(item.get("record_id") or "").strip()
+            quantity = int(item.get("quantity") or 0)
+            if not record_id or quantity < 1:
+                raise ValueError("Each selected product needs a catalog identity and quantity.")
+            if record_id in seen:
+                raise ValueError("The same product was selected more than once.")
+            seen.add(record_id)
+            record = self._active_record(vendor, record_id)
+            if record is None:
+                raise FileNotFoundError("A selected product is no longer available.")
+            offer = self._offer_from_record(vendor, record)
+            available = offer.get("inventory")
+            name = offer["name"]
+            if available is not None and quantity > available:
+                raise ValueError(
+                    f"Only {available} {name} are currently available. Please update your quantity."
+                )
+            unit = int(offer["price_minor"])
+            line = {
+                "record_id": record["record_id"],
+                "name": name,
+                "brand": offer.get("brand"),
+                "quantity": quantity,
+                "unit_price_minor": unit,
+                "subtotal_minor": unit * quantity,
+                "currency": offer["currency"],
+                "available": available,
+            }
+            displayed = item.get("displayed_price")
+            if displayed is not None:
+                try:
+                    shown = Decimal(str(displayed)) * _MINOR_PER_MAJOR
+                    line["displayed_price_minor"] = (
+                        int(shown) if shown == shown.to_integral() else None
+                    )
+                except (InvalidOperation, ValueError):
+                    line["displayed_price_minor"] = None
+            if currency and line["currency"] != currency:
+                raise ValueError("Selected products must share one currency.")
+            currency = line["currency"]
+            lines.append(line)
+        return lines
+
+    def _active_record(self, vendor: Document, record_id: str) -> Document | None:
+        """Load one active record by the Phase 1 canonical identity only."""
+        revision = vendor.get("active_sync_id")
+        if not revision:
+            return None
+        return self.records.find_one(
+            {
+                "vendor_id": vendor["_id"],
+                "sync_id": revision,
+                "record_id": record_id,
+            }
+        )
+
+    def _offer_from_record(self, vendor: Document, record: Mapping[str, Any]) -> Document:
+        """Read current title, price, currency, and stock from catalog data, not the browser."""
+        mapping = vendor.get("mapping")
+        commerce = record.get("commerce")
+        if not isinstance(commerce, Mapping):
+            commerce = self.project_record(record, mapping) if mapping else None
+        data = record.get("data") if isinstance(record.get("data"), Mapping) else {}
+        name = ""
+        if isinstance(commerce, Mapping):
+            name = str(commerce.get("title") or "").strip()
+        if not name:
+            aliases = self.config.mapping.aliases.get("title", ())
+            for key in aliases:
+                value = data.get(key)
+                if value not in (None, ""):
+                    name = str(value).strip()
+                    break
+        price_minor = commerce.get("price") if isinstance(commerce, Mapping) else None
+        if not isinstance(price_minor, int):
+            units = (mapping or {}).get("price_units")
+            price_minor = _minor_price(data.get("price"), units)
+        currency = ""
+        if isinstance(commerce, Mapping):
+            currency = str(commerce.get("currency") or "").strip().upper()
+        if not currency:
+            currency = str(data.get("currency") or (mapping or {}).get("default_currency") or "")
+            currency = currency.strip().upper()
+        if not name or not isinstance(price_minor, int) or not _CURRENCY.fullmatch(currency):
+            raise ValueError(
+                "This product cannot be purchased because its current price is unavailable."
+            )
+        brand = ""
+        if isinstance(commerce, Mapping):
+            brand = str(commerce.get("brand") or "").strip()
+        if not brand:
+            brand = str(data.get("brand") or "").strip()
+        stock = None
+        if isinstance(commerce, Mapping) and commerce.get("inventory") is not None:
+            stock = _count(commerce.get("inventory"))
+        if stock is None:
+            for key in self.config.mapping.aliases.get("inventory", ()):
+                stock = _count(data.get(key))
+                if stock is not None:
+                    break
+        offer: Document = {
+            "name": name,
+            "price_minor": price_minor,
+            "currency": currency,
+            "inventory": stock,
+        }
+        if brand:
+            offer["brand"] = brand
+        return offer
+
+    def _purchase_document(
+        self, reference: VendorReference, attempt_id: str
+    ) -> tuple[Document, Document]:
+        """Resolve one vendor-scoped purchase attempt without exposing storage details."""
+        vendor = self._find_vendor(reference)
+        if not vendor:
+            raise FileNotFoundError("The requested storefront was not found.")
+        document = self.purchases.find_one(
+            {"vendor_id": vendor["_id"], "attempt_id": str(attempt_id or "").strip()}
+        )
+        if document is None:
+            raise FileNotFoundError("The requested purchase was not found.")
+        return vendor, document
+
+    @staticmethod
+    def _payment_state() -> Document:
+        """Record that Phase 2 stops before provider execution and inventory mutation."""
+        return {
+            "started": False,
+            "succeeded": False,
+            "failed": False,
+            "provider": None,
+        }
+
+    def _purchase_view(self, document: Mapping[str, Any]) -> Document:
+        """Return shopper-safe purchase facts plus operator audit fields without secrets."""
+        items = []
+        stale = False
+        for item in document.get("items") or []:
+            displayed = item.get("displayed_price_minor")
+            if displayed is not None and displayed != item.get("unit_price_minor"):
+                stale = True
+            items.append(
+                {
+                    "name": item.get("name"),
+                    "brand": item.get("brand"),
+                    "quantity": item.get("quantity"),
+                    "unit_price": _major_units(int(item["unit_price_minor"])),
+                    "subtotal": _major_units(int(item["subtotal_minor"])),
+                    "currency": item.get("currency"),
+                }
+            )
+        notices = [
+            "Availability shown when selected.",
+            "Current price will be verified.",
+            "Current availability will be verified.",
+            "You will be redirected to the payment provider.",
+            "No payment has been made yet.",
+        ]
+        if stale:
+            notices.insert(
+                0,
+                "The price shown earlier was a snapshot. The current catalog price is being used.",
+            )
+        payment = dict(document.get("payment") or self._payment_state())
+        return {
+            "id": document["attempt_id"],
+            "status": document["status"],
+            "items": items,
+            "total": _major_units(int(document["total_minor"])),
+            "currency": document.get("currency"),
+            "notices": notices,
+            "payment": {
+                "started": bool(payment.get("started")),
+                "succeeded": bool(payment.get("succeeded")),
+                "failed": bool(payment.get("failed")),
+            },
+            "authorized_at": document.get("authorized_at"),
+            "cancelled_at": document.get("cancelled_at"),
+        }
 
     def list_syncs(self, reference: VendorReference, limit: int = 20) -> list[Document]:
         """Return recent revision history without exposing source artifact bytes."""

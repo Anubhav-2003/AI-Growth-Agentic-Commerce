@@ -63,6 +63,26 @@ class ChatRequest(StrictModel):
     history: list[dict[str, str]] = Field(default_factory=list)
 
 
+class PurchaseLineInput(StrictModel):
+    """Accept a shopper selection snapshot; catalog identity and price stay server-side."""
+
+    record_id: str = Field(min_length=1, max_length=128)
+    quantity: int = Field(ge=1, le=10000)
+    displayed_price: float | None = Field(default=None, ge=0)
+
+
+class PurchaseReviewRequest(StrictModel):
+    """Open a purchase review from selected lines without treating it as payment."""
+
+    items: list[PurchaseLineInput] = Field(min_length=1)
+
+
+class PurchaseAuthorizeRequest(StrictModel):
+    """Require an unambiguous confirmation before any later payment handoff."""
+
+    confirm: bool
+
+
 class BrowserDecision(StrictModel):
     """Represent one exact machine-page transition or the final grounded answer."""
 

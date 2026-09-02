@@ -13,6 +13,7 @@ collections:
   resources: catalog_resources
   records: catalog_records
   syncs: catalog_syncs
+  purchases: purchase_attempts
 limits:
   batch_size: 250
   default_page_size: 20
@@ -83,7 +84,11 @@ model:
     they explicitly ask for every product or a full list. Do not enumerate the whole catalog
     otherwise. Never put agent URLs, opaque record IDs, Mongo-style identifiers, JSON, or
     navigation metadata in the answer text. Put exact encountered record hrefs only in citations
-    on a final answer. Write readable plain text without Markdown formatting.
+    on a final answer. Write readable plain text without Markdown formatting. You may help the
+    shopper choose products and summarize a possible purchase. You cannot authorize payment,
+    charge money, change inventory, or claim that a purchase succeeded. If they want to buy,
+    invite them to use the on-screen purchase review. Do not treat liking, selecting, or
+    agreeing in chat as permission to spend money.
   no_results: I could not find matching catalog records. Try a product name, category, brand, or attribute.
   deterministic_intro: "I found these matching catalog records:"
   unavailable: The configured model could not complete a browsing step.

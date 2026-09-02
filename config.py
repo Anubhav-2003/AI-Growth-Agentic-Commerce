@@ -32,6 +32,7 @@ class CollectionConfig(BaseModel):
     resources: str
     records: str
     syncs: str
+    purchases: str
 
 
 class LimitConfig(BaseModel):

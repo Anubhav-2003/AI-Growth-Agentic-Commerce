@@ -22,7 +22,15 @@ from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 from agent_web import create_agent_app
 from config import Settings, get_settings
 from model_layer import AgentBrowser, AgentResponseError, ModelGateway
-from models import ChatRequest, MappingUpdate, Problem, VendorCreate, VendorPatch
+from models import (
+    ChatRequest,
+    MappingUpdate,
+    Problem,
+    PurchaseAuthorizeRequest,
+    PurchaseReviewRequest,
+    VendorCreate,
+    VendorPatch,
+)
 from services.catalog_service import CatalogService
 from services.normalization_service import NormalizationService
 
@@ -288,6 +296,35 @@ def create_app(
         root = str(request.base_url).rstrip("/")
         entry = f"{root}{config.routes.agent}/{quote(str(vendor['slug']), safe='')}/"
         return await request.app.state.agent_browser.run(payload.message, entry, payload.history)
+
+    @management.post("/vendors/{reference}/purchases/review")
+    def review_purchase(reference: str, payload: PurchaseReviewRequest) -> dict[str, Any]:
+        """Rebuild a purchase summary from live catalog data without charging or stocking writes."""
+        _vendor_or_404(catalog, reference)
+        return {"purchase": catalog.review_purchase(reference, payload.items)}
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/authorize")
+    def authorize_purchase(
+        reference: str, attempt_id: str, payload: PurchaseAuthorizeRequest
+    ) -> dict[str, Any]:
+        """Accept only explicit confirmation, then stop before payment-provider execution."""
+        _vendor_or_404(catalog, reference)
+        return {
+            "purchase": catalog.authorize_purchase(reference, attempt_id, payload.confirm),
+            "message": (
+                "Your purchase is authorized. Payment has not started yet, "
+                "and inventory was not changed."
+            ),
+        }
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/cancel")
+    def cancel_purchase(reference: str, attempt_id: str) -> dict[str, Any]:
+        """Cancel a review or authorization without creating a paid order."""
+        _vendor_or_404(catalog, reference)
+        return {
+            "purchase": catalog.cancel_purchase(reference, attempt_id),
+            "message": "Purchase cancelled. Inventory was not changed.",
+        }
 
     app.include_router(management)
     app.mount(
