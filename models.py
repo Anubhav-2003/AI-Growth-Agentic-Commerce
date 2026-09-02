@@ -78,9 +78,27 @@ class PurchaseReviewRequest(StrictModel):
 
 
 class PurchaseAuthorizeRequest(StrictModel):
-    """Require an unambiguous confirmation before any later payment handoff."""
+    """Require an unambiguous confirmation and an optional spending ceiling."""
 
     confirm: bool
+    max_amount: float | None = Field(default=None, ge=0)
+
+
+class PaymentVerifyRequest(StrictModel):
+    """Accept Checkout callback identifiers; retries may reuse stored values."""
+
+    razorpay_payment_id: str | None = Field(default=None, max_length=64)
+    razorpay_order_id: str | None = Field(default=None, max_length=64)
+    razorpay_signature: str | None = Field(default=None, max_length=256)
+
+    @field_validator("razorpay_payment_id", "razorpay_order_id", "razorpay_signature")
+    @classmethod
+    def blank_optional_callback(cls, value: str | None) -> str | None:
+        """Treat empty callback fields as omitted so a retry can use stored identifiers."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class BrowserDecision(StrictModel):

@@ -46,6 +46,7 @@ def integration_environment(
         model_provider=None,
         model_name=None,
         model_api_base=None,
+        razorpay_enabled=False,
     )
     try:
         mongo.admin.command("ping")
@@ -180,8 +181,8 @@ def test_dashboard_static_health_and_readiness(client: TestClient) -> None:
     assert "length >= 2" not in script.text
     assert "length > 2" not in script.text
     assert "maxSelected" not in script.text
-    assert "Razorpay" not in script.text
-    assert "razorpay" not in script.text
+    assert "RAZORPAY_KEY_SECRET" not in script.text
+    assert "webhook_secret" not in script.text
     assert "Confirm purchase and continue to payment" in script.text
     assert "function addToCart" in script.text
     assert "/orders" not in script.text
@@ -193,7 +194,7 @@ def test_dashboard_static_health_and_readiness(client: TestClient) -> None:
         assert "fetchJson" not in body
         assert "fetch(" not in body
         assert "/inventory" not in body
-        assert "Razorpay" not in body
+        assert "RAZORPAY_KEY_SECRET" not in body
 
     health = client.get("/api/health")
     ready = client.get("/api/ready")
@@ -460,7 +461,9 @@ def test_purchase_review_authorize_and_cancel_do_not_mutate_inventory(
     assert purchase["items"][2]["subtotal"] == pytest.approx(119.97)
     assert purchase["total"] == pytest.approx(358.87)
     assert purchase["currency"] == "USD"
-    assert purchase["payment"] == {"started": False, "succeeded": False, "failed": False}
+    assert purchase["payment"]["started"] is False
+    assert purchase["payment"]["succeeded"] is False
+    assert purchase["payment"]["failed"] is False
     dumped = json.dumps(purchase["items"])
     assert "record_id" not in dumped
     assert sneakers["_id"] not in dumped

@@ -976,12 +976,30 @@ async function confirmPurchase() {
   state.purchaseBusy = true;
   renderChat();
   try {
+    state.chat.push({
+      role: "assistant",
+      content: "Preparing secure payment...",
+      mode: "selection",
+      local: true,
+    });
+    renderChat();
     const result = await fetchJson(
       apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/authorize`),
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) }
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirm: true,
+          max_amount: Number(state.purchase.total),
+        }),
+      }
     );
     state.purchase = result?.purchase || state.purchase;
-    state.purchasePhase = "authorized";
+    state.purchasePhase = state.purchase?.status || "authorized";
+    if (result?.purchase?.checkout?.order_id && result.purchase.checkout.key_id) {
+      await openCheckout(result.purchase.checkout);
+      return;
+    }
     state.chat.push({
       role: "assistant",
       content: result?.message || "Your purchase is authorized. Payment has not started yet.",
@@ -994,6 +1012,127 @@ async function confirmPurchase() {
   } finally {
     state.purchaseBusy = false;
     renderChat();
+  }
+}
+
+async function openCheckout(checkout) {
+  const Checkout = window.Razorpay;
+  if (typeof Checkout !== "function") {
+    throw new Error("Payment checkout could not be loaded.");
+  }
+  await new Promise((resolve) => {
+    const session = new Checkout({
+      key: checkout.key_id,
+      amount: checkout.amount,
+      currency: checkout.currency,
+      name: checkout.name || settings.appName,
+      order_id: checkout.order_id,
+      handler: (response) => {
+        verifyCheckoutPayment(response).finally(resolve);
+      },
+      modal: {
+        ondismiss: () => {
+          abandonCheckout().finally(resolve);
+        },
+      },
+    });
+    session.on("payment.failed", () => {
+      abandonCheckout().finally(resolve);
+    });
+    session.open();
+  });
+}
+
+async function verifyCheckoutPayment(response) {
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/verify`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          razorpay_payment_id: response.razorpay_payment_id,
+          razorpay_order_id: response.razorpay_order_id,
+          razorpay_signature: response.razorpay_signature,
+        }),
+      }
+    );
+    applyPaymentVerificationResult(result);
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({
+      role: "assistant",
+      content: error.message || "Payment was not completed. No inventory was changed.",
+      mode: "error",
+      local: true,
+    });
+  }
+}
+
+async function retryPaymentConfirmation() {
+  if (!state.vendor || !state.purchase?.id || state.purchaseBusy) return;
+  state.purchaseBusy = true;
+  renderChat();
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/verify`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }
+    );
+    applyPaymentVerificationResult(result);
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({
+      role: "assistant",
+      content: error.message || "Payment was not completed. No inventory was changed.",
+      mode: "error",
+      local: true,
+    });
+  } finally {
+    state.purchaseBusy = false;
+    renderChat();
+  }
+}
+
+function applyPaymentVerificationResult(result) {
+  state.purchase = result?.purchase || state.purchase;
+  state.purchasePhase = state.purchase?.status || "payment_pending";
+  const pending = state.purchase?.payment?.status === "verification_pending" || result?.retryable;
+  state.chat.push({
+    role: "assistant",
+    content: pending
+      ? (result?.message || "Payment may have succeeded, but we couldn't confirm it with Razorpay yet. Don't pay again. Retry payment confirmation.")
+      : (result?.message || "Payment successful. Your order has been confirmed. Inventory has been updated."),
+    mode: pending ? "selection" : "selection",
+    local: true,
+  });
+}
+
+async function abandonCheckout() {
+  if (!state.vendor || !state.purchase?.id) return;
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/failed`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+    );
+    state.purchase = result?.purchase || state.purchase;
+    state.purchasePhase = "failed";
+    state.chat.push({
+      role: "assistant",
+      content: result?.message || "Payment was not completed. No inventory was changed.",
+      mode: "selection",
+      local: true,
+    });
+  } catch {
+    state.chat.push({
+      role: "assistant",
+      content: "Payment was not completed. No inventory was changed.",
+      mode: "selection",
+      local: true,
+    });
   }
 }
 
@@ -1069,6 +1208,10 @@ function handleProductSelect(event) {
   }
   if (control.dataset.confirmPurchase) {
     confirmPurchase();
+    return;
+  }
+  if (control.dataset.retryPaymentConfirmation) {
+    retryPaymentConfirmation();
     return;
   }
   if (control.dataset.cancelPurchase) cancelPurchase();
@@ -1162,23 +1305,33 @@ function renderChatContext() {
     const cart = make("button", "button button-secondary", "Add to cart");
     cart.type = "button";
     cart.dataset.addToCart = "true";
+    const verificationPending = state.purchase?.payment?.status === "verification_pending";
     const buy = make("button", "button button-primary", "Buy now");
     buy.type = "button";
     buy.dataset.buyNow = "true";
-    buy.disabled = state.purchaseBusy;
+    buy.disabled = state.purchaseBusy || verificationPending;
     actions.append(cart, buy);
     chosen.append(actions);
+    if (verificationPending) {
+      chosen.append(make("span", "purchase-note", "Don't pay again. Retry payment confirmation for the current purchase."));
+    }
     if (state.cartItems.length) {
       chosen.append(make("span", "purchase-note", `${state.cartItems.length} products in cart. No payment has been made.`));
     }
     container.append(chosen);
   }
-  if (state.purchase && (state.purchasePhase === "review" || state.purchasePhase === "authorized")) {
+  if (state.purchase && ["review", "authorized", "payment_pending", "paid", "failed"].includes(state.purchasePhase)) {
     const review = make("div", "purchase-review");
-    review.append(make("span", "selected-product-label", "Review your purchase"));
+    const verificationPending = state.purchase?.payment?.status === "verification_pending";
+    review.append(make("span", "selected-product-label", state.purchasePhase === "paid" ? "Order confirmed" : "Review your purchase"));
     for (const item of state.purchase.items || []) appendSummaryCard(review, item);
     const total = formatAmount(state.purchase.total, state.purchase.currency);
     if (total) review.append(make("strong", "purchase-total", `Total: ${total}`));
+    if (state.purchasePhase === "review") {
+      const bound = formatAmount(state.purchase.total, state.purchase.currency);
+      const store = state.vendor?.name || "this store";
+      review.append(make("span", "purchase-note", `You're authorizing ${settings.appName} to spend up to ${bound} on this purchase at ${store}.`));
+    }
     for (const notice of state.purchase.notices || []) review.append(make("span", "purchase-note", notice));
     if (state.purchasePhase === "review") {
       const actions = make("div", "purchase-actions");
@@ -1192,8 +1345,21 @@ function renderChatContext() {
       cancel.disabled = state.purchaseBusy;
       actions.append(confirm, cancel);
       review.append(actions);
+    } else if (state.purchasePhase === "paid") {
+      review.append(make("span", "purchase-note", "Payment successful. Your order has been confirmed. Inventory has been updated."));
+    } else if (verificationPending) {
+      review.append(make("span", "purchase-note", "Payment may have succeeded, but we couldn't confirm it with Razorpay yet. Don't pay again. Retry payment confirmation."));
+      const actions = make("div", "purchase-actions");
+      const retry = make("button", "button button-primary", "Retry payment confirmation");
+      retry.type = "button";
+      retry.dataset.retryPaymentConfirmation = "true";
+      retry.disabled = state.purchaseBusy;
+      actions.append(retry);
+      review.append(actions);
+    } else if (state.purchasePhase === "failed") {
+      review.append(make("span", "purchase-note", "Payment was not completed. No inventory was changed."));
     } else {
-      review.append(make("span", "purchase-note", "Your purchase is authorized. Payment has not started yet, and inventory was not changed."));
+      review.append(make("span", "purchase-note", "No payment has been completed yet, and inventory was not changed."));
     }
     container.append(review);
   }

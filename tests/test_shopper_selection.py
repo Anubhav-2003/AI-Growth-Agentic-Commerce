@@ -154,8 +154,8 @@ def test_shopper_script_has_unbounded_selection_without_inventory_writes() -> No
     assert "function removeSelectedProduct" in script
     assert "length >= 2" not in script
     assert "length > 2" not in script
-    assert "Razorpay" not in script
-    assert "razorpay" not in script
+    assert "RAZORPAY_KEY_SECRET" not in script
+    assert "webhook_secret" not in script
     for name in ("selectProduct", "changeQuantity", "removeSelectedProduct", "addToCart"):
         body = script.split(f"function {name}", 1)[1].split("\nfunction ", 1)[0]
         assert "fetchJson" not in body
@@ -172,7 +172,14 @@ def test_shopper_script_has_unbounded_selection_without_inventory_writes() -> No
     assert "/cancel" in cancel
     assert "/inventory" not in review
     assert "/inventory" not in confirm
-    assert "Razorpay" not in script
+    retry = script.split("function retryPaymentConfirmation", 1)[1].split("\nfunction ", 1)[0]
+    assert "/payment/verify" in retry
+    assert "/purchases/review" not in retry
+    assert "session.open" not in retry
+    assert "Don't pay again" in script
+    assert "Retry payment confirmation" in script
+    assert "verificationPending" in script
+    assert "RAZORPAY_KEY_SECRET" not in script
     assert (
         "record_id"
         not in script.split("function appendSummaryCard", 1)[1].split("\nfunction ", 1)[0]

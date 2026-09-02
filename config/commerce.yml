@@ -14,6 +14,7 @@ collections:
   records: catalog_records
   syncs: catalog_syncs
   purchases: purchase_attempts
+  orders: catalog_orders
 limits:
   batch_size: 250
   default_page_size: 20
@@ -29,6 +30,7 @@ limits:
   agent_max_steps: 8
   model_timeout_seconds: 45
   mongo_timeout_milliseconds: 10000
+  authorization_ttl_seconds: 1800
 security:
   admin_header: X-Admin-Key
   local_environments: [development, test, local]

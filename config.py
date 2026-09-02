@@ -33,6 +33,7 @@ class CollectionConfig(BaseModel):
     records: str
     syncs: str
     purchases: str
+    orders: str
 
 
 class LimitConfig(BaseModel):
@@ -52,6 +53,7 @@ class LimitConfig(BaseModel):
     agent_max_steps: int = Field(gt=0)
     model_timeout_seconds: int = Field(gt=0)
     mongo_timeout_milliseconds: int = Field(gt=0)
+    authorization_ttl_seconds: int = Field(gt=0)
 
 
 class SecurityConfig(BaseModel):
@@ -132,6 +134,10 @@ class Settings(BaseSettings):
     model_name: str | None = None
     model_api_key: SecretStr | None = None
     model_api_base: str | None = None
+    razorpay_enabled: bool = False
+    razorpay_key_id: str | None = None
+    razorpay_key_secret: SecretStr | None = None
+    razorpay_webhook_secret: SecretStr | None = None
 
     @field_validator(
         "admin_api_key",
@@ -139,6 +145,9 @@ class Settings(BaseSettings):
         "model_name",
         "model_api_key",
         "model_api_base",
+        "razorpay_key_id",
+        "razorpay_key_secret",
+        "razorpay_webhook_secret",
         mode="before",
     )
     @classmethod
