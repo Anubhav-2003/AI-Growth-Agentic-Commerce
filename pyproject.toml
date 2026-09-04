@@ -33,6 +33,9 @@ dev = [
 [tool.uv]
 package = false
 
+[tool.vercel]
+entrypoint = "main:app"
+
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers --disable-warnings"
 pythonpath = ["."]
