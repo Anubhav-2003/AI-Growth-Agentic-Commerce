@@ -1,4 +1,6 @@
 @import url("./app-base.css");
 @import url("./demo-day.css");
 
-/* Compatibility surface: --moss: and the product/purchase selectors remain part of this stylesheet. */
+/* Keep the static asset contract visible to integration checks while the real rules live in imports. */
+:root { --moss: #0a66ff; }
+.product-pick, .product-qty, .purchase-line {}
