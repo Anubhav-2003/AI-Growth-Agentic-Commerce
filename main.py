@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -22,9 +23,23 @@ from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 from agent_web import create_agent_app
 from config import Settings, get_settings
 from model_layer import AgentBrowser, AgentResponseError, ModelGateway
-from models import ChatRequest, MappingUpdate, Problem, VendorCreate, VendorPatch
+from models import (
+    ChatRequest,
+    MappingUpdate,
+    PaymentVerifyRequest,
+    Problem,
+    PurchaseAuthorizeRequest,
+    PurchaseReviewRequest,
+    VendorCreate,
+    VendorPatch,
+)
 from services.catalog_service import CatalogService
 from services.normalization_service import NormalizationService
+from services.payments import (
+    PaymentUnavailable,
+    RazorpayAgenticProvider,
+    build_payment_provider,
+)
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -68,6 +83,7 @@ def _sync_view(sync: dict[str, Any]) -> dict[str, Any]:
 def create_app(
     settings: Settings | None = None,
     mongo_client: MongoClient[dict[str, Any]] | None = None,
+    payment_provider: Any | None = None,
 ) -> FastAPI:
     """Compose the outer control plane and nested agent website around shared services."""
     resolved, owns_client = settings or get_settings(), mongo_client is None
@@ -84,6 +100,10 @@ def create_app(
     catalog = CatalogService(client[resolved.mongodb_database], config)
     normalizer = NormalizationService(catalog, resolved.source_roots, config.formats, config.limits)
     model = ModelGateway(resolved, config)
+    payments = (
+        payment_provider if payment_provider is not None else build_payment_provider(resolved)
+    )
+    agentic = RazorpayAgenticProvider()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -106,6 +126,8 @@ def create_app(
     app.state.normalizer = normalizer
     app.state.model = model
     app.state.mongo_client = client
+    app.state.payments = payments
+    app.state.agentic = agentic
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_body_size=config.limits.max_request_bytes,
@@ -141,6 +163,11 @@ def create_app(
         """Hide approved root locations when a source attempts to escape them."""
         return _problem(request, 403, "The configured source path is not permitted.")
 
+    @app.exception_handler(PaymentUnavailable)
+    async def payment_unavailable(request: Request, error: PaymentUnavailable) -> JSONResponse:
+        """Keep missing payment capabilities as safe client errors."""
+        return _problem(request, 400, str(error))
+
     @app.exception_handler(ValueError)
     async def value_error(request: Request, error: ValueError) -> JSONResponse:
         """Return deterministic source and cursor validation failures as bad requests."""
@@ -149,7 +176,7 @@ def create_app(
     @app.exception_handler(AgentResponseError)
     async def agent_response_error(request: Request, _error: AgentResponseError) -> JSONResponse:
         """Hide native provider failures and malformed decisions behind one safe boundary."""
-        return _problem(request, 502, "The configured model could not complete a browsing step.")
+        return _problem(request, 502, config.model.unavailable)
 
     @app.exception_handler(PyMongoError)
     async def mongo_error(request: Request, _error: PyMongoError) -> JSONResponse:
@@ -205,6 +232,17 @@ def create_app(
         """Confirm Mongo is reachable for deployment readiness probes."""
         client.admin.command("ping")
         return {"status": "ready"}
+
+    def _checkout_payload(purchase: dict[str, Any], vendor: dict[str, Any]) -> dict[str, Any]:
+        """Add the public Razorpay Key ID only when a backend order already exists."""
+        checkout = dict(purchase.get("checkout") or {})
+        if not checkout.get("order_id") or not resolved.razorpay_key_id:
+            purchase.pop("checkout", None)
+            return purchase
+        checkout["key_id"] = resolved.razorpay_key_id
+        checkout["name"] = vendor.get("name") or config.app.name
+        purchase["checkout"] = checkout
+        return purchase
 
     management = APIRouter(
         prefix=config.routes.api,
@@ -288,6 +326,169 @@ def create_app(
         root = str(request.base_url).rstrip("/")
         entry = f"{root}{config.routes.agent}/{quote(str(vendor['slug']), safe='')}/"
         return await request.app.state.agent_browser.run(payload.message, entry, payload.history)
+
+    @management.post("/vendors/{reference}/purchases/review")
+    def review_purchase(reference: str, payload: PurchaseReviewRequest) -> dict[str, Any]:
+        """Rebuild a purchase summary from live catalog data without charging or stocking writes."""
+        _vendor_or_404(catalog, reference)
+        return {"purchase": catalog.review_purchase(reference, payload.items)}
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/authorize")
+    def authorize_purchase(
+        reference: str, attempt_id: str, payload: PurchaseAuthorizeRequest
+    ) -> dict[str, Any]:
+        """Accept explicit confirmation, store a spending bound, then start Checkout."""
+        vendor = _vendor_or_404(catalog, reference)
+        purchase = catalog.authorize_purchase(
+            reference, attempt_id, payload.confirm, payload.max_amount
+        )
+        message = (
+            "Your purchase is authorized. Payment has not started yet, "
+            "and inventory was not changed."
+        )
+        if resolved.razorpay_enabled:
+            if not payments.available():
+                raise PaymentUnavailable(
+                    "Razorpay Test Mode is enabled but credentials are missing."
+                )
+            amount_minor, currency = catalog.payable_amount(reference, attempt_id)
+            created = payments.create_payment(
+                amount_minor=amount_minor,
+                currency=currency,
+                receipt=purchase["id"][:40],
+                notes={"attempt": purchase["id"]},
+            )
+            created_order = {
+                "provider_order_id": created.provider_order_id,
+                "amount_minor": amount_minor,
+                "currency": currency,
+            }
+            if int(created.amount_minor) != amount_minor or created.currency != currency:
+                raise ValueError("The payment provider amount did not match the catalog total.")
+            purchase = catalog.start_provider_payment(
+                reference, attempt_id, created_order, payments.name
+            )
+            purchase = _checkout_payload(purchase, vendor)
+            message = "Preparing secure payment..."
+        return {
+            "purchase": purchase,
+            "message": message,
+            "agentic": {"available": agentic.available()},
+        }
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/payment/verify")
+    def verify_payment(
+        reference: str, attempt_id: str, payload: PaymentVerifyRequest
+    ) -> dict[str, Any]:
+        """Verify Checkout results server-side before any inventory change."""
+        _vendor_or_404(catalog, reference)
+        purchase = catalog.verify_and_fulfill_payment(
+            reference,
+            attempt_id,
+            browser_order_id=payload.razorpay_order_id,
+            payment_id=payload.razorpay_payment_id,
+            signature=payload.razorpay_signature,
+            provider=payments,
+        )
+        paid = purchase.get("status") == "paid"
+        pending = (purchase.get("payment") or {}).get("status") == "verification_pending"
+        if pending:
+            return {
+                "purchase": purchase,
+                "retryable": True,
+                "message": (
+                    "Payment may have succeeded, but we couldn't confirm it with Razorpay yet. "
+                    "Don't pay again. Retry payment confirmation."
+                ),
+            }
+        return {
+            "purchase": purchase,
+            "message": (
+                "Payment successful. Your order has been confirmed. Inventory has been updated."
+                if paid
+                else "Payment was not completed. No inventory was changed."
+            ),
+        }
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/payment/failed")
+    def payment_failed(reference: str, attempt_id: str) -> dict[str, Any]:
+        """Record an abandoned Checkout without fulfilling or decrementing stock."""
+        _vendor_or_404(catalog, reference)
+        return {
+            "purchase": catalog.mark_payment_failed(reference, attempt_id),
+            "message": "Payment was not completed. No inventory was changed.",
+        }
+
+    @management.post("/vendors/{reference}/purchases/{attempt_id}/cancel")
+    def cancel_purchase(reference: str, attempt_id: str) -> dict[str, Any]:
+        """Cancel a review or authorization without creating a paid order."""
+        _vendor_or_404(catalog, reference)
+        return {
+            "purchase": catalog.cancel_purchase(reference, attempt_id),
+            "message": "Purchase cancelled. Inventory was not changed.",
+        }
+
+    @app.post(f"{config.routes.api}/payments/razorpay/webhook")
+    async def razorpay_webhook(request: Request) -> dict[str, str]:
+        """Verify raw webhook bodies and funnel captured payments through one fulfillment path."""
+        body = await request.body()
+        signature = request.headers.get("X-Razorpay-Signature", "")
+        event_id = request.headers.get("X-Razorpay-Event-Id") or ""
+        try:
+            payments.verify_webhook(body, signature)
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except Exception:
+            LOGGER.warning("Razorpay webhook rejected (%s)", "signature")
+            raise HTTPException(
+                status_code=400, detail="The webhook could not be verified."
+            ) from None
+        event = str(payload.get("event") or "")
+        entity = ((payload.get("payload") or {}).get("payment") or {}).get("entity") or {}
+        if event == "order.paid":
+            entity = ((payload.get("payload") or {}).get("order") or {}).get("entity") or entity
+        order_id = str(entity.get("order_id") or entity.get("id") or "")
+        payment_id = (
+            str(entity.get("id") or "") if event != "order.paid" else str(entity.get("id") or "")
+        )
+        found = catalog.find_purchase_by_provider_order(order_id)
+        if not found:
+            return {"status": "ignored"}
+        vendor, document = found
+        already_paid = document.get("status") == "paid" or document.get("fulfillment") == "complete"
+        if event_id and event_id in (document.get("webhook_ids") or []) and already_paid:
+            return {"status": "ok"}
+        if event in {"payment.failed"}:
+            catalog.mark_payment_failed(vendor["_id"], document["attempt_id"])
+            if event_id:
+                catalog.purchases.update_one(
+                    {"_id": document["_id"]}, {"$addToSet": {"webhook_ids": event_id}}
+                )
+            return {"status": "ok"}
+        if event in {"payment.captured", "order.paid"}:
+            live_payment = str(entity.get("id") or payment_id)
+            if event == "order.paid":
+                live_payment = str(
+                    ((payload.get("payload") or {}).get("payment") or {})
+                    .get("entity", {})
+                    .get("id")
+                    or live_payment
+                )
+            catalog.finalize_successful_payment(
+                vendor,
+                document,
+                payment_id=live_payment,
+                order_id=str((document.get("payment") or {}).get("razorpay_order_id") or order_id),
+                amount_minor=int(entity.get("amount") or document["total_minor"]),
+                currency=str(entity.get("currency") or document["currency"]),
+                captured=True,
+                live_order_id=str(entity.get("order_id") or order_id),
+                live_status="captured",
+            )
+            if event_id:
+                catalog.purchases.update_one(
+                    {"_id": document["_id"]}, {"$addToSet": {"webhook_ids": event_id}}
+                )
+        return {"status": "ok"}
 
     app.include_router(management)
     app.mount(

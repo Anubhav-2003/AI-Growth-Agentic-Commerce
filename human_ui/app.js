@@ -25,7 +25,8 @@ const state = {
   vendors: [], vendor: null, resources: [], records: [], syncs: [],
   resource: null, record: null, recordsCursor: null, catalogQuery: "",
   mappingResource: null, agentDocument: "home", agentJson: null,
-  chat: [], chatPending: false, syncing: false, epoch: 0,
+  chat: [], chatPending: false, selectedProducts: [], cartItems: [],
+  purchase: null, purchasePhase: "selected", purchaseBusy: false, syncing: false, epoch: 0,
 };
 const numberFormatter = new Intl.NumberFormat();
 const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
@@ -154,8 +155,10 @@ function showState(container, title, detail, actionLabel, action, isError = fals
 
 // Surface a transient result while keeping inline view states intact.
 function notify(message, kind = "success") {
+  const text = String(message || "").trim();
+  if (!text) return;
   const notice = byId("global-notice");
-  byId("global-notice-text").textContent = message;
+  byId("global-notice-text").textContent = text;
   notice.className = `global-notice${kind === "error" ? " is-error" : kind === "warning" ? " is-warning" : ""}`;
   notice.hidden = false;
   window.clearTimeout(notify.timer);
@@ -249,6 +252,11 @@ async function selectVendor(vendor) {
   state.mappingResource = null;
   state.agentJson = null;
   state.chat = [];
+  state.selectedProducts = [];
+  state.cartItems = [];
+  state.purchase = null;
+  state.purchasePhase = "selected";
+  state.purchaseBusy = false;
   state.epoch += 1;
   if (vendor) localStorage.setItem(settings.vendorKey, idOf(vendor)); else localStorage.removeItem(settings.vendorKey);
   renderVendorSelect();
@@ -759,43 +767,510 @@ function chooseAgentDocument(event) {
 }
 
 // Render an initial chat prompt or the complete safe conversation log.
+function sourceTitle(source) {
+  const title = String(source?.title || "").trim();
+  const label = String(source?.label || "").trim();
+  const opaque = /^[\w-]+\/[a-f0-9]{8,}/i;
+  if (title && !opaque.test(title)) return title;
+  if (label && !opaque.test(label)) return label;
+  return "View product";
+}
+
+function productKey(product) {
+  return String(product?.record_id || "").trim();
+}
+
+function selectedEntry(product) {
+  const key = productKey(product);
+  return key ? state.selectedProducts.find((item) => productKey(item) === key) : null;
+}
+
+function formatAmount(amount, currency) {
+  const value = Number(amount);
+  const code = String(currency || "USD").trim() || "USD";
+  if (!Number.isFinite(value)) return "";
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: code }).format(value);
+  } catch {
+    return `${value} ${code}`;
+  }
+}
+
+function formatMoney(product) {
+  return formatAmount(product?.price, product?.currency);
+}
+
+function lineAmount(item) {
+  const price = Number(item?.price ?? item?.unit_price);
+  const quantity = quantityValue(item);
+  if (!Number.isFinite(price)) return null;
+  return (Math.round(price * 100) * quantity) / 100;
+}
+
+function selectionTotal(items) {
+  return items.reduce((sum, item) => sum + (lineAmount(item) || 0), 0);
+}
+
+function looksLikeBuyIntent(text) {
+  return /\b(buy|purchase|check\s*out|pay for)\b/i.test(String(text || ""));
+}
+
+function knownStock(product) {
+  const count = Number(product?.inventory);
+  return Number.isFinite(count) && count >= 0 ? count : null;
+}
+
+function stockLabel(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const labels = { in_stock: "In stock", low_stock: "Low stock", out_of_stock: "Out of stock" };
+  return labels[raw] || raw.replaceAll("_", " ");
+}
+
+function stockMessage(product) {
+  const count = knownStock(product);
+  if (count !== null) return `${numberFormatter.format(count)} available`;
+  return stockLabel(product.availability);
+}
+
+function quantityValue(item) {
+  const count = Math.trunc(Number(item?.quantity));
+  return Number.isFinite(count) && count >= 1 ? count : 1;
+}
+
+function quantityNote(item) {
+  const stock = knownStock(item);
+  const quantity = quantityValue(item);
+  if (stock !== null && quantity > stock) return `Only ${numberFormatter.format(stock)} are currently shown as available.`;
+  return "";
+}
+
+function appendQuantityControls(card, item) {
+  const row = make("div", "product-qty");
+  const quantity = quantityValue(item);
+  const minus = make("button", "icon-button product-qty-btn", "−");
+  minus.type = "button";
+  minus.dataset.quantityDelta = "-1";
+  minus.dataset.productKey = productKey(item);
+  minus.setAttribute("aria-label", "Decrease quantity");
+  minus.disabled = quantity <= 1;
+  const plus = make("button", "icon-button product-qty-btn", "+");
+  plus.type = "button";
+  plus.dataset.quantityDelta = "1";
+  plus.dataset.productKey = productKey(item);
+  plus.setAttribute("aria-label", "Increase quantity");
+  const value = make("span", "product-qty-value", String(quantity));
+  value.setAttribute("aria-live", "polite");
+  row.append(make("span", "product-qty-label", "Quantity"), minus, value, plus);
+  card.append(row);
+  const note = quantityNote(item);
+  if (note) card.append(make("span", "product-qty-note", note));
+}
+
+function appendProductCard(container, source, messageIndex, sourceIndex) {
+  const product = source.product;
+  const selected = selectedEntry(product);
+  const card = make("article", `product-pick${selected ? " is-selected" : ""}`);
+  card.append(make("strong", "product-pick-name", product.name || sourceTitle(source)));
+  if (product.brand) card.append(make("span", "product-pick-brand", product.brand));
+  const price = formatMoney(product);
+  if (price) card.append(make("span", "product-pick-price", price));
+  const stock = stockMessage(product);
+  if (stock) card.append(make("span", "product-pick-stock", stock));
+  if (selected) appendQuantityControls(card, selected);
+  const actions = make("div", "product-pick-actions");
+  const button = make("button", `button ${selected ? "button-secondary" : "button-primary"} product-pick-select`);
+  button.type = "button";
+  button.dataset.selectProduct = "true";
+  button.dataset.message = String(messageIndex);
+  button.dataset.source = String(sourceIndex);
+  button.setAttribute("aria-pressed", String(Boolean(selected)));
+  button.textContent = selected ? "Selected ✓" : "Select product";
+  actions.append(button);
+  if (selected) {
+    const remove = make("button", "button button-quiet product-pick-remove", "Remove");
+    remove.type = "button";
+    remove.dataset.removeProduct = productKey(selected);
+    actions.append(remove);
+  }
+  card.append(actions);
+  container.append(card);
+}
+
+function selectProduct(product) {
+  const key = productKey(product);
+  if (!key) return;
+  if (selectedEntry(product)) {
+    renderChat();
+    return;
+  }
+  state.selectedProducts.push({ ...product, quantity: 1 });
+  state.chat.push({
+    role: "assistant",
+    content: `Selected ${product.name || "this product"}.`,
+    mode: "selection",
+    local: true,
+  });
+  renderChat();
+}
+
+function changeQuantity(key, delta) {
+  const item = state.selectedProducts.find((entry) => productKey(entry) === String(key || ""));
+  if (!item) return;
+  const next = Math.max(1, quantityValue(item) + (Math.trunc(Number(delta)) || 0));
+  if (next === quantityValue(item)) return;
+  item.quantity = next;
+  renderChat();
+}
+
+function removeSelectedProduct(key) {
+  const identity = String(key || "");
+  const remaining = state.selectedProducts.filter((item) => productKey(item) !== identity);
+  if (remaining.length === state.selectedProducts.length) return;
+  state.selectedProducts = remaining;
+  renderChat();
+}
+
+function addToCart() {
+  if (!state.selectedProducts.length) return;
+  state.cartItems = state.selectedProducts.map((item) => ({ ...item }));
+  state.chat.push({
+    role: "assistant",
+    content: "Added to cart. No payment has been made, and availability has not been reserved.",
+    mode: "selection",
+    local: true,
+  });
+  renderChat();
+}
+
+function purchaseLines() {
+  return state.selectedProducts.map((item) => ({
+    record_id: productKey(item),
+    quantity: quantityValue(item),
+    displayed_price: Number.isFinite(Number(item.price)) ? Number(item.price) : undefined,
+  }));
+}
+
+async function reviewPurchase() {
+  if (!state.vendor || !state.selectedProducts.length || state.purchaseBusy) return;
+  state.purchaseBusy = true;
+  renderChat();
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/review`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items: purchaseLines() }) }
+    );
+    state.purchase = result?.purchase || null;
+    state.purchasePhase = "review";
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({ role: "assistant", content: error.message, mode: "error", local: true });
+  } finally {
+    state.purchaseBusy = false;
+    renderChat();
+  }
+}
+
+async function confirmPurchase() {
+  if (!state.vendor || !state.purchase?.id || state.purchaseBusy) return;
+  state.purchaseBusy = true;
+  renderChat();
+  try {
+    state.chat.push({
+      role: "assistant",
+      content: "Preparing secure payment...",
+      mode: "selection",
+      local: true,
+    });
+    renderChat();
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/authorize`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirm: true,
+          max_amount: Number(state.purchase.total),
+        }),
+      }
+    );
+    state.purchase = result?.purchase || state.purchase;
+    state.purchasePhase = state.purchase?.status || "authorized";
+    if (result?.purchase?.checkout?.order_id && result.purchase.checkout.key_id) {
+      await openCheckout(result.purchase.checkout);
+      return;
+    }
+    state.chat.push({
+      role: "assistant",
+      content: result?.message || "Your purchase is authorized. Payment has not started yet.",
+      mode: "selection",
+      local: true,
+    });
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({ role: "assistant", content: error.message, mode: "error", local: true });
+  } finally {
+    state.purchaseBusy = false;
+    renderChat();
+  }
+}
+
+async function openCheckout(checkout) {
+  const Checkout = window.Razorpay;
+  if (typeof Checkout !== "function") {
+    throw new Error("Payment checkout could not be loaded.");
+  }
+  await new Promise((resolve) => {
+    const session = new Checkout({
+      key: checkout.key_id,
+      amount: checkout.amount,
+      currency: checkout.currency,
+      name: checkout.name || settings.appName,
+      order_id: checkout.order_id,
+      handler: (response) => {
+        verifyCheckoutPayment(response).finally(resolve);
+      },
+      modal: {
+        ondismiss: () => {
+          abandonCheckout().finally(resolve);
+        },
+      },
+    });
+    session.on("payment.failed", () => {
+      abandonCheckout().finally(resolve);
+    });
+    session.open();
+  });
+}
+
+async function verifyCheckoutPayment(response) {
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/verify`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          razorpay_payment_id: response.razorpay_payment_id,
+          razorpay_order_id: response.razorpay_order_id,
+          razorpay_signature: response.razorpay_signature,
+        }),
+      }
+    );
+    applyPaymentVerificationResult(result);
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({
+      role: "assistant",
+      content: error.message || "Payment was not completed. No inventory was changed.",
+      mode: "error",
+      local: true,
+    });
+  }
+}
+
+async function retryPaymentConfirmation() {
+  if (!state.vendor || !state.purchase?.id || state.purchaseBusy) return;
+  state.purchaseBusy = true;
+  renderChat();
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/verify`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }
+    );
+    applyPaymentVerificationResult(result);
+  } catch (error) {
+    notify(error.message, "error");
+    state.chat.push({
+      role: "assistant",
+      content: error.message || "Payment was not completed. No inventory was changed.",
+      mode: "error",
+      local: true,
+    });
+  } finally {
+    state.purchaseBusy = false;
+    renderChat();
+  }
+}
+
+function applyPaymentVerificationResult(result) {
+  state.purchase = result?.purchase || state.purchase;
+  state.purchasePhase = state.purchase?.status || "payment_pending";
+  const pending = state.purchase?.payment?.status === "verification_pending" || result?.retryable;
+  state.chat.push({
+    role: "assistant",
+    content: pending
+      ? (result?.message || "Payment may have succeeded, but we couldn't confirm it with Razorpay yet. Don't pay again. Retry payment confirmation.")
+      : (result?.message || "Payment successful. Your order has been confirmed. Inventory has been updated."),
+    mode: pending ? "selection" : "selection",
+    local: true,
+  });
+}
+
+async function abandonCheckout() {
+  if (!state.vendor || !state.purchase?.id) return;
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(state.purchase.id)}/payment/failed`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+    );
+    state.purchase = result?.purchase || state.purchase;
+    state.purchasePhase = "failed";
+    state.chat.push({
+      role: "assistant",
+      content: result?.message || "Payment was not completed. No inventory was changed.",
+      mode: "selection",
+      local: true,
+    });
+  } catch {
+    state.chat.push({
+      role: "assistant",
+      content: "Payment was not completed. No inventory was changed.",
+      mode: "selection",
+      local: true,
+    });
+  }
+}
+
+async function cancelPurchase() {
+  const attempt = state.purchase?.id;
+  if (state.purchaseBusy) return;
+  if (!attempt) {
+    state.purchase = null;
+    state.purchasePhase = "cancelled";
+    renderChat();
+    return;
+  }
+  state.purchaseBusy = true;
+  renderChat();
+  try {
+    const result = await fetchJson(
+      apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/purchases/${encodeURIComponent(attempt)}/cancel`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+    );
+    state.purchase = result?.purchase || state.purchase;
+    state.purchasePhase = "cancelled";
+    state.chat.push({
+      role: "assistant",
+      content: result?.message || "Purchase cancelled. Inventory was not changed.",
+      mode: "selection",
+      local: true,
+    });
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    state.purchaseBusy = false;
+    renderChat();
+  }
+}
+
+function appendSummaryCard(container, item) {
+  const card = make("article", "purchase-line");
+  card.append(make("strong", "purchase-line-name", item.name || "Product"));
+  if (item.brand) card.append(make("span", "purchase-line-brand", item.brand));
+  card.append(make("span", "purchase-line-qty", `Quantity: ${quantityValue(item)}`));
+  const unit = formatAmount(item.unit_price ?? item.price, item.currency);
+  if (unit) card.append(make("span", "purchase-line-price", `${unit} each`));
+  const subtotal = formatAmount(item.subtotal ?? lineAmount(item), item.currency);
+  if (subtotal) card.append(make("span", "purchase-line-subtotal", `Subtotal: ${subtotal}`));
+  container.append(card);
+}
+
+function handleProductSelect(event) {
+  const control = event.target.closest("[data-select-product], [data-quantity-delta], [data-remove-product], [data-add-to-cart], [data-buy-now], [data-review-purchase], [data-confirm-purchase], [data-cancel-purchase]");
+  if (!control) return;
+  event.preventDefault();
+  if (control.dataset.selectProduct) {
+    const message = state.chat[Number(control.dataset.message)];
+    const source = message?.sources?.[Number(control.dataset.source)];
+    if (source?.product) selectProduct(source.product);
+    return;
+  }
+  if (control.dataset.quantityDelta) {
+    changeQuantity(control.dataset.productKey, control.dataset.quantityDelta);
+    return;
+  }
+  if (control.dataset.removeProduct) {
+    removeSelectedProduct(control.dataset.removeProduct);
+    return;
+  }
+  if (control.dataset.addToCart) {
+    addToCart();
+    return;
+  }
+  if (control.dataset.buyNow || control.dataset.reviewPurchase) {
+    reviewPurchase();
+    return;
+  }
+  if (control.dataset.confirmPurchase) {
+    confirmPurchase();
+    return;
+  }
+  if (control.dataset.retryPaymentConfirmation) {
+    retryPaymentConfirmation();
+    return;
+  }
+  if (control.dataset.cancelPurchase) cancelPurchase();
+}
+
 function renderChat() {
   const log = byId("chat-log");
+  const suggestions = byId("prompt-suggestions");
   log.replaceChildren();
+  suggestions.hidden = Boolean(state.chat.length || state.chatPending);
   if (!state.chat.length && !state.chatPending) {
     const empty = make("div", "chat-empty");
-    empty.append(make("span", "chat-glyph", "✦"), make("h2", "", state.vendor ? `Ask about ${state.vendor.name || "this catalog"}` : "Select a storefront first"), make("p", "", `${settings.appName} enters the machine storefront, follows its live controls, and returns the pages that support the answer.`));
+    const store = state.vendor?.name || "this store";
+    empty.append(
+      make("span", "chat-glyph", "✦"),
+      make("h2", "", state.vendor ? `Ask about ${store}` : "Select a storefront first"),
+      make("p", "", state.vendor ? `Ask about products, prices, or recommendations. ${settings.appName} will browse the store and answer from what it finds.` : "Choose a storefront to start a conversation.")
+    );
     log.append(empty);
   }
-  for (const message of state.chat) {
-    const item = make("article", `chat-message is-${message.role === "user" ? "user" : "assistant"}`);
-    item.append(make("span", "chat-message-label", message.role === "user" ? "You" : `${settings.appName}${message.mode ? ` · ${message.mode}` : ""}`), make("div", "chat-bubble", message.content));
+  state.chat.forEach((message, messageIndex) => {
+    const item = make("article", `chat-message is-${message.role === "user" ? "user" : "assistant"}${message.mode === "error" ? " is-error" : ""}`);
+    item.append(
+      make("span", "chat-message-label", message.role === "user" ? "You" : settings.appName),
+      make("div", "chat-bubble", message.content)
+    );
     if (message.sources?.length) {
       const sources = make("div", "chat-sources");
-      for (const source of message.sources) {
+      message.sources.forEach((source, sourceIndex) => {
+        if (source?.product && productKey(source.product)) {
+          appendProductCard(sources, source, messageIndex, sourceIndex);
+          return;
+        }
         const href = safeUrl(source.url || source.href || source.agent_url);
-        if (!href) continue;
-        const link = make("a", "", source.title || source.label || source.id || "Open source record");
+        if (!href) return;
+        const link = make("a", "chat-source");
         link.href = href;
         link.target = "_blank";
         link.rel = "noopener";
+        link.append(make("strong", "", sourceTitle(source)), make("span", "", "View product →"));
         sources.append(link);
-      }
+      });
       item.append(sources);
     }
-    if (message.trace?.length) {
-      const trace = make("div", "chat-trace");
-      for (const step of message.trace) trace.append(make("span", "", `${step.operation} · ${step.title || step.page_type || "page"}`));
-      item.append(trace);
+    if (message.purchasePrompt && state.selectedProducts.length) {
+      const review = make("button", "button button-primary", "Review purchase");
+      review.type = "button";
+      review.dataset.reviewPurchase = "true";
+      review.disabled = state.purchaseBusy;
+      item.append(review);
     }
     log.append(item);
-  }
+  });
   if (state.chatPending) {
     const item = make("article", "chat-message is-assistant");
     const dots = make("div", "typing");
-    dots.setAttribute("aria-label", `${settings.appName} is browsing the machine storefront`);
+    dots.setAttribute("aria-label", `${settings.appName} is writing`);
     dots.append(make("span"), make("span"), make("span"));
-    item.append(make("span", "chat-message-label", `${settings.appName} · browsing`), dots);
+    item.append(make("span", "chat-message-label", settings.appName), dots);
     log.append(item);
   }
   byId("chat-input").disabled = !state.vendor || state.chatPending;
@@ -818,6 +1293,76 @@ function renderChatContext() {
     stats.append(row);
   }
   container.replaceChildren(stats);
+  if (state.selectedProducts.length) {
+    const currency = state.selectedProducts[0]?.currency || "USD";
+    const chosen = make("div", "selected-items");
+    chosen.append(make("span", "selected-product-label", "Selected items"));
+    for (const item of state.selectedProducts) appendSummaryCard(chosen, item);
+    const total = formatAmount(selectionTotal(state.selectedProducts), currency);
+    if (total) chosen.append(make("strong", "purchase-total", `Total: ${total}`));
+    chosen.append(make("span", "purchase-note", "Availability shown when selected."));
+    const actions = make("div", "purchase-actions");
+    const cart = make("button", "button button-secondary", "Add to cart");
+    cart.type = "button";
+    cart.dataset.addToCart = "true";
+    const verificationPending = state.purchase?.payment?.status === "verification_pending";
+    const buy = make("button", "button button-primary", "Buy now");
+    buy.type = "button";
+    buy.dataset.buyNow = "true";
+    buy.disabled = state.purchaseBusy || verificationPending;
+    actions.append(cart, buy);
+    chosen.append(actions);
+    if (verificationPending) {
+      chosen.append(make("span", "purchase-note", "Don't pay again. Retry payment confirmation for the current purchase."));
+    }
+    if (state.cartItems.length) {
+      chosen.append(make("span", "purchase-note", `${state.cartItems.length} products in cart. No payment has been made.`));
+    }
+    container.append(chosen);
+  }
+  if (state.purchase && ["review", "authorized", "payment_pending", "paid", "failed"].includes(state.purchasePhase)) {
+    const review = make("div", "purchase-review");
+    const verificationPending = state.purchase?.payment?.status === "verification_pending";
+    review.append(make("span", "selected-product-label", state.purchasePhase === "paid" ? "Order confirmed" : "Review your purchase"));
+    for (const item of state.purchase.items || []) appendSummaryCard(review, item);
+    const total = formatAmount(state.purchase.total, state.purchase.currency);
+    if (total) review.append(make("strong", "purchase-total", `Total: ${total}`));
+    if (state.purchasePhase === "review") {
+      const bound = formatAmount(state.purchase.total, state.purchase.currency);
+      const store = state.vendor?.name || "this store";
+      review.append(make("span", "purchase-note", `You're authorizing ${settings.appName} to spend up to ${bound} on this purchase at ${store}.`));
+    }
+    for (const notice of state.purchase.notices || []) review.append(make("span", "purchase-note", notice));
+    if (state.purchasePhase === "review") {
+      const actions = make("div", "purchase-actions");
+      const confirm = make("button", "button button-primary", "Confirm purchase and continue to payment");
+      confirm.type = "button";
+      confirm.dataset.confirmPurchase = "true";
+      confirm.disabled = state.purchaseBusy;
+      const cancel = make("button", "button button-quiet", "Cancel");
+      cancel.type = "button";
+      cancel.dataset.cancelPurchase = "true";
+      cancel.disabled = state.purchaseBusy;
+      actions.append(confirm, cancel);
+      review.append(actions);
+    } else if (state.purchasePhase === "paid") {
+      review.append(make("span", "purchase-note", "Payment successful. Your order has been confirmed. Inventory has been updated."));
+    } else if (verificationPending) {
+      review.append(make("span", "purchase-note", "Payment may have succeeded, but we couldn't confirm it with Razorpay yet. Don't pay again. Retry payment confirmation."));
+      const actions = make("div", "purchase-actions");
+      const retry = make("button", "button button-primary", "Retry payment confirmation");
+      retry.type = "button";
+      retry.dataset.retryPaymentConfirmation = "true";
+      retry.disabled = state.purchaseBusy;
+      actions.append(retry);
+      review.append(actions);
+    } else if (state.purchasePhase === "failed") {
+      review.append(make("span", "purchase-note", "Payment was not completed. No inventory was changed."));
+    } else {
+      review.append(make("span", "purchase-note", "No payment has been completed yet, and inventory was not changed."));
+    }
+    container.append(review);
+  }
 }
 
 // Send one bounded question with only recent conversational history.
@@ -826,7 +1371,7 @@ async function sendChat(event) {
   const input = byId("chat-input");
   const message = input.value.trim();
   if (!message || !state.vendor || state.chatPending) return;
-  const history = state.chat.slice(-settings.chatHistoryLimit).map((item) => ({ role: item.role, content: item.content }));
+  const history = state.chat.filter((item) => !item.local).slice(-settings.chatHistoryLimit).map((item) => ({ role: item.role, content: item.content }));
   state.chat.push({ role: "user", content: message });
   state.chatPending = true;
   input.value = "";
@@ -835,7 +1380,16 @@ async function sendChat(event) {
   try {
     const result = await fetchJson(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/chat`), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, history }) });
     state.chat.push({ role: "assistant", content: result?.answer || "No grounded answer was returned.", mode: result?.mode || "grounded", sources: result?.sources || [], trace: result?.trace || [] });
-    byId("chat-mode").textContent = result?.mode === "agent" ? "Agent · website traversal" : "Deterministic website search";
+    if (looksLikeBuyIntent(message) && state.selectedProducts.length) {
+      state.chat.push({
+        role: "assistant",
+        content: "Sure. I'll prepare the purchase summary before payment.",
+        mode: "selection",
+        local: true,
+        purchasePrompt: true,
+      });
+    }
+    byId("chat-mode").textContent = result?.mode === "agent" || result?.mode === "deterministic" ? "In conversation" : "Ready";
   } catch (error) {
     state.chat.push({ role: "assistant", content: `I could not retrieve a grounded answer: ${error.message}`, mode: "error", sources: [] });
   } finally {
@@ -947,6 +1501,8 @@ function bindEvents() {
   document.querySelector(".segmented").addEventListener("click", chooseAgentDocument);
   byId("copy-agent-json").addEventListener("click", () => copyText(state.agentJson ? JSON.stringify(state.agentJson, null, 2) : "", "Agent JSON"));
   byId("chat-form").addEventListener("submit", sendChat);
+  byId("chat-log").addEventListener("click", handleProductSelect);
+  byId("chat-context").addEventListener("click", handleProductSelect);
   byId("chat-input").addEventListener("input", resizeChatInput);
   byId("chat-input").addEventListener("keydown", handleChatKeydown);
   byId("prompt-suggestions").addEventListener("click", handleSuggestion);

@@ -366,3 +366,55 @@ def test_legacy_vendor_shape_remains_queryable(
     }
     assert vendor["format"] == "csv" and vendor["location"] == "Bengaluru"
     assert by_slug and by_slug["_id"] == str(identifier)
+
+
+def test_purchase_review_rereads_catalog_and_does_not_write_inventory(
+    services: tuple[Path, CatalogService, NormalizationService],
+) -> None:
+    """Selection-to-review uses live catalog price and stock without mutating records."""
+    root, catalog, normalizer = services
+    source = root / "shop.csv"
+    source.write_text(
+        "sku,name,description,brand,price,currency,stock_quantity\n"
+        "FAS-001,Classic Canvas Sneakers,Everyday sneakers,Northline,59.95,USD,33\n",
+        encoding="utf-8",
+    )
+    vendor = _create_vendor(catalog, "Purchase Catalog", "csv", source)
+    normalizer.run(vendor["_id"])
+    catalog.update_mapping(
+        vendor["_id"],
+        {
+            "resource": "shop",
+            "fields": {
+                "id": "sku",
+                "title": "name",
+                "description": "description",
+                "price": "price",
+                "currency": "currency",
+                "brand": "brand",
+                "inventory": "stock_quantity",
+            },
+            "price_units": "major",
+        },
+    )
+    record = catalog.list_records(vendor["_id"], resource="shop", limit=10)["items"][0]
+    before = catalog.records.find_one({"record_id": record["_id"]})
+    review = catalog.review_purchase(
+        vendor["_id"],
+        [{"record_id": record["_id"], "quantity": 2, "displayed_price": 1}],
+    )
+    assert review["items"][0]["unit_price"] == 59.95
+    assert review["total"] == 119.9
+    assert review["payment"]["started"] is False
+    authorized = catalog.authorize_purchase(vendor["_id"], review["id"], True)
+    cancelled = catalog.cancel_purchase(vendor["_id"], review["id"])
+    after = catalog.records.find_one({"record_id": record["_id"]})
+    assert authorized["status"] == "authorized"
+    assert cancelled["status"] == "cancelled"
+    assert before is not None and after is not None
+    assert after["data"] == before["data"]
+    assert after.get("commerce") == before.get("commerce")
+    with pytest.raises(ValueError, match="currently available"):
+        catalog.review_purchase(vendor["_id"], [{"record_id": record["_id"], "quantity": 40}])
+    with pytest.raises(ValueError, match="Explicit purchase confirmation"):
+        catalog.authorize_purchase(vendor["_id"], review["id"], False)

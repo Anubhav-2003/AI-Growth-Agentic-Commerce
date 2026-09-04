@@ -2,6 +2,7 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +32,8 @@ class CollectionConfig(BaseModel):
     resources: str
     records: str
     syncs: str
+    purchases: str
+    orders: str
 
 
 class LimitConfig(BaseModel):
@@ -50,6 +53,7 @@ class LimitConfig(BaseModel):
     agent_max_steps: int = Field(gt=0)
     model_timeout_seconds: int = Field(gt=0)
     mongo_timeout_milliseconds: int = Field(gt=0)
+    authorization_ttl_seconds: int = Field(gt=0)
 
 
 class SecurityConfig(BaseModel):
@@ -95,6 +99,7 @@ class ModelConfig(BaseModel):
     system_prompt: str
     no_results: str
     deterministic_intro: str
+    unavailable: str
 
 
 class CommerceConfig(BaseModel):
@@ -129,6 +134,10 @@ class Settings(BaseSettings):
     model_name: str | None = None
     model_api_key: SecretStr | None = None
     model_api_base: str | None = None
+    razorpay_enabled: bool = False
+    razorpay_key_id: str | None = None
+    razorpay_key_secret: SecretStr | None = None
+    razorpay_webhook_secret: SecretStr | None = None
 
     @field_validator(
         "admin_api_key",
@@ -136,6 +145,9 @@ class Settings(BaseSettings):
         "model_name",
         "model_api_key",
         "model_api_base",
+        "razorpay_key_id",
+        "razorpay_key_secret",
+        "razorpay_webhook_secret",
         mode="before",
     )
     @classmethod
@@ -164,5 +176,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Reuse one immutable-by-convention settings instance per process."""
+    """Reuse one settings instance after loading `.env` into the process for libraries."""
+    load_dotenv()
     return Settings()  # type: ignore[call-arg]

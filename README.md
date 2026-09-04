@@ -55,8 +55,12 @@ Startup pings MongoDB and creates the required indexes. The process will not bec
 | `MODEL_NAME` | Provider model identifier | blank |
 | `MODEL_API_KEY` | Server-side API key for the selected provider | blank |
 | `MODEL_API_BASE` | Optional provider-compatible API base | blank |
+| `RAZORPAY_ENABLED` | Enable Razorpay Standard Checkout in TEST mode | `false` |
+| `RAZORPAY_KEY_ID` | Public TEST Key ID for Checkout | blank |
+| `RAZORPAY_KEY_SECRET` | Server-side TEST Key Secret | blank |
+| `RAZORPAY_WEBHOOK_SECRET` | Optional webhook signing secret | blank |
 
-Set `MODEL_PROVIDER`, `MODEL_NAME`, and `MODEL_API_KEY` to enable model chat. The key is passed only to AnyLLM on the server and is never exposed to the browser or stored in MongoDB. Provider-standard environment variables remain supported when the service process supplies them, but `MODEL_API_KEY` is the portable `.env` setting.
+Set `MODEL_PROVIDER`, `MODEL_NAME`, and `MODEL_API_KEY` to enable model chat. Startup loads `.env` into the process, so a manual `export` of that file is not required. `MODEL_API_KEY` is passed explicitly into AnyLLM. Provider-native names such as `GEMINI_API_KEY` also work after that load; prefer `MODEL_API_KEY` so every provider uses the same CommerceOS setting. The key is never exposed to the browser or stored in MongoDB.
 
 AnyLLM directly supports `gemini` and `groq`; model IDs stay configuration values so releases do not require source changes. As of 2026-08-30, Google lists `gemini-3.7-flash` as its latest stable Gemini model, and Groq lists `openai/gpt-oss-120b` as a current production model. Groq has deprecated Llama 3.3 70B for developer-tier use; use the provider's live model list when selecting an ID. See the [Gemini model guide](https://ai.google.dev/gemini-api/docs/models) and [Groq supported models](https://console.groq.com/docs/models).
 
@@ -70,6 +74,8 @@ CommerceOS uses the configured database and these logical collections:
 - `catalog_resources`
 - `catalog_records`
 - `catalog_syncs`
+- `purchase_attempts`
+- `catalog_orders`
 - GridFS collections prefixed by `catalog_syncs_artifacts`
 
 MongoDB may be local, containerized, or remote; only `MONGODB_URI` changes. For the example configuration, confirm connectivity with:
@@ -110,6 +116,12 @@ The old `/register`, `/login`, and `/home` URLs redirect to this dashboard. A re
 | `GET` | `/api/vendors/{reference}/records` | Active records; accepts `resource`, `q`, `cursor`, and `limit` |
 | `PUT` | `/api/vendors/{reference}/mapping` | Replace the explicit mapping and rebuild additive projections |
 | `POST` | `/api/vendors/{reference}/chat` | Grounded answer plus record-page citations |
+| `POST` | `/api/vendors/{reference}/purchases/review` | Rebuild a purchase summary from live catalog data |
+| `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/authorize` | Explicit confirmation, spending bound, and optional TEST Checkout order |
+| `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/payment/verify` | Server-side Checkout signature and payment verification |
+| `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/payment/failed` | Record an abandoned Checkout |
+| `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/cancel` | Cancel a review or unpaid attempt |
+| `POST` | `/api/payments/razorpay/webhook` | Razorpay webhook (raw-body signature); no operator key |
 
 A minimal local workflow is:
 
@@ -264,7 +276,8 @@ config.py                          Validated environment and YAML settings
 config/commerce.yml                Shared non-secret routes, limits, aliases, and protocols
 models.py                          Pydantic management and agent-page contracts
 services/normalization_service.py  Lossless CSV/JSON/SQLite normalization
-services/catalog_service.py        Mongo persistence, revisions, queries, and projection
+services/catalog_service.py        Mongo persistence, revisions, queries, projection, and fulfillment
+services/payments.py               Razorpay TEST Checkout adapter and unavailable agentic adapter
 agent_web/app.py                   Nested linked-JSON and UCP application
 model_layer/client.py              AnyLLM decisions and LangGraph agent-page browser
 human_ui/                          Dashboard template, styles, and browser client
@@ -272,17 +285,39 @@ tests/                             Agent, model, normalization, and integration 
 vendor_databases/                  Local example source data
 ```
 
+## Payments
+
+CommerceOS splits payments into three layers. Razorpay Test Mode uses simulated transactions; no real money moves.
+
+### Phase 3A — Razorpay Standard Checkout (TEST)
+
+When `RAZORPAY_ENABLED=true` and TEST credentials are set, explicit purchase confirmation creates a Razorpay **Orders API** order from the authoritative catalog total, then opens **Standard Checkout**. The Key ID may be sent to the browser. The Key Secret never is. Fulfillment runs only after HMAC-SHA256 signature verification against the **stored** order id, a live Payments API status of `captured`, and amount/currency checks.
+
+Payment verification may temporarily become unavailable after Checkout. CommerceOS does not assume payment failure, does not create another Checkout, and allows verification to be retried against the same purchase attempt. Inventory is updated only after successful server-side verification.
+
+### Phase 3B — CommerceOS authorization and spending bounds
+
+Product selection and “I want to buy this” are not payment consent. Confirming a purchase stores an authorization policy (maximum amount, currency, vendor, attempt, expiry). The backend refuses to start or fulfill payment when the live total exceeds that ceiling, the currency/vendor/attempt do not match, or the authorization has expired.
+
+### Phase 3C — Razorpay Agentic Payments / UPI Reserve Pay (not active)
+
+This is **not** Standard Checkout. Razorpay describes Agentic Payments and UPI Reserve Pay (NPCI Single Block Multi Debit) as a partner/early-access capability. Official docs require raising a request with Razorpay Support to activate UPI Reserve Pay; there is no public self-serve TEST SDK method configured in this repository. CommerceOS therefore keeps a clearly unavailable `RazorpayAgenticProvider`. Do not treat Checkout as agentic execution.
+
+To enable Phase 3C later you would need: Razorpay account activation for UPI Reserve Pay / Agentic Payments, the official Reserve/mandate APIs Razorpay assigns after onboarding, TEST credentials for that product, and webhook events for those APIs. Until that access exists, Phase 3A remains the working demonstration.
+
+### Inventory
+
+Stock does not change for selection, cart, review, authorization, order creation, Checkout open, failure, cancellation, or invalid signatures. Inventory decrements once, idempotently, only after verified captured payment. Duplicate success callbacks do not decrement twice. Local MongoDB is typically a standalone node, so multi-item decrements are applied sequentially with compensating restores if a later line fails; a replica set would allow a true multi-document transaction.
+
 ## Honest first-release boundaries
 
-This release proves lossless local-source normalization, explicit projection, linked agent browsing, UCP catalog reads, operator visibility, and grounded chat. It does **not** implement:
+This release proves lossless local-source normalization, explicit projection, linked agent browsing, UCP catalog reads, operator visibility, grounded chat, bounded purchase authorization, and Razorpay **Standard Checkout** in TEST mode. It does **not** implement:
 
-- cart, checkout, payment, refund, return, order, or inventory mutations;
-- AP2 mandates, payment credentials, or PCI-sensitive handling;
+- Razorpay Agentic Payments or UPI Reserve Pay execution;
+- AP2 mandates, wallets, or PCI-sensitive card storage;
 - merchant/user accounts, OAuth, sessions, or production identity authentication;
-- Shopify, WooCommerce, Magento, remote SQL, object-store, webhook, or live write-back adapters;
+- Shopify, WooCommerce, Magento, remote SQL, object-store, or live catalog write-back adapters;
 - background jobs for long synchronizations;
 - vector or embedding search;
 - MCP, A2A, ACP, or automation of conventional HTML/screenshot websites;
 - generative normalization or mapping.
-
-Do not advertise or build operational workflows on those absent capabilities. Extend the shared lossless records and catalog service rather than creating a parallel source of truth.

@@ -14,9 +14,11 @@ dependencies = [
   "langgraph==1.2.11",
   "pydantic-settings==2.15.0",
   "pymongo==4.17.0",
+  "python-dotenv==1.2.3",
   "python-slugify==8.0.4",
   "pyyaml==6.0.3",
   "rapidfuzz==3.14.5",
+  "razorpay==2.0.1",
   "ucp-sdk==0.5.0",
   "uvicorn[standard]==0.52.4",
 ]

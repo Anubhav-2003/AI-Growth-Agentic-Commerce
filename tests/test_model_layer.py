@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,9 +12,11 @@ import pytest
 import yaml
 from fastapi import FastAPI
 from jsonschema.exceptions import ValidationError as SchemaValidationError
+from pydantic import ValidationError
 
 from config import CommerceConfig, Settings
 from model_layer import AgentBrowser, AgentResponseError, ModelGateway
+from model_layer.client import ProviderDecision
 from models import BrowserDecision
 
 
@@ -46,6 +49,58 @@ def _settings(
         model_api_key=api_key,
         model_api_base=api_base,
     )
+
+
+def test_unconfigured_gateway_skips_any_llm_and_stays_deterministic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Leave AnyLLM untouched when provider and model are both blank."""
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "model_layer.client.AnyLLM.create", lambda *_args, **_kwargs: calls.append(True)
+    )
+    gateway = ModelGateway(_settings(tmp_path), commerce_config)
+
+    assert gateway.configured is False
+    assert gateway.client is None
+    assert calls == []
+
+
+def test_create_failure_does_not_raise_and_blocks_deterministic_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Keep the process running when AnyLLM rejects construction, without a fake catalog answer."""
+
+    def create(_provider: str, **_options: Any) -> None:
+        """Stand in for a missing provider environment key without using a live SDK."""
+        raise RuntimeError("provider-secret-must-not-escape")
+
+    monkeypatch.setattr("model_layer.client.AnyLLM.create", create)
+    gateway = ModelGateway(
+        _settings(tmp_path, provider="gemini", model="gemini-3.6-flash"), commerce_config
+    )
+    app = FastAPI()
+
+    @app.get("/agent/shop/")
+    def home() -> dict[str, Any]:
+        """Give the browser a valid storefront page so failure is isolated to the model."""
+        return {
+            "page": {"id": "http://store.test/agent/shop/", "type": "store", "title": "Shop"},
+            "data": {},
+            "entities": [],
+            "links": [],
+            "actions": [],
+            "meta": {},
+        }
+
+    assert gateway.configured is True
+    assert gateway.client is None
+    with pytest.raises(AgentResponseError, match="could not complete"):
+        asyncio.run(
+            AgentBrowser(gateway, app, commerce_config).run(
+                "Find a lamp", "http://store.test/agent/shop/"
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -132,7 +187,7 @@ def test_configured_provider_uses_fake_async_client_without_network(
     }
     assert calls["completion"]["model"] == "fake-model"
     assert calls["completion"]["timeout"] == commerce_config.limits.model_timeout_seconds
-    assert calls["completion"]["response_format"] is BrowserDecision
+    assert calls["completion"]["response_format"] is ProviderDecision
     assert [item["role"] for item in calls["completion"]["messages"]] == [
         "system",
         "user",
@@ -256,3 +311,549 @@ def test_gemini_and_groq_accept_explicit_api_keys(
     )
 
     assert gateway.client is not None
+
+
+def test_system_prompt_keeps_human_answers_free_of_machine_identifiers(
+    commerce_config: CommerceConfig,
+) -> None:
+    """Shopper-facing answer policy lives in shared YAML, not provider-specific code."""
+    prompt = commerce_config.model.system_prompt.casefold()
+    assert "concise" in prompt
+    assert "full list" in prompt
+    assert "citations" in prompt
+    assert "agent url" in prompt
+    assert "opaque" in prompt
+    assert "answer only from" in prompt or "visited page" in prompt
+    assert "insufficient" in prompt
+    assert "resource name" in prompt
+    assert "must not include answer text" in prompt
+    assert "on a final answer" in prompt
+    assert "cannot authorize payment" in prompt
+    assert "charge money" in prompt
+
+
+def test_browser_decision_has_no_payment_operation() -> None:
+    """Natural-language browsing cannot encode a financial authorization."""
+    with pytest.raises(ValidationError):
+        BrowserDecision(operation="pay", target="charge")
+    with pytest.raises(ValidationError):
+        BrowserDecision(operation="authorize", answer="charge the card")
+
+
+def test_sources_prefer_human_titles_and_keep_agent_hrefs(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Human chat can label a record by name while the agent URL remains for grounding."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/deadbeef"
+    sources = browser._sources(
+        [
+            {
+                "url": href,
+                "page": {
+                    "page": {"type": "record", "title": "deadbeef"},
+                    "data": {
+                        "resource": "products",
+                        "_id": "deadbeef",
+                        "data": {"name": "Trail Pack", "price": "89"},
+                    },
+                },
+            }
+        ]
+    )
+
+    assert sources == [
+        {
+            "label": "products/deadbeef",
+            "href": href,
+            "title": "Trail Pack",
+            "product": {"record_id": "deadbeef", "name": "Trail Pack", "price": 89},
+        }
+    ]
+
+
+def test_sources_omit_incidental_list_entities_without_citations_or_opened_records(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Visited search hits stay in observations; they are not human sources by default."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    entities = [
+        {
+            "id": f"id-{index}",
+            "type": "record",
+            "resource": "products",
+            "href": f"http://store.test/agent/shop/resources/products/id-{index}",
+            "data": {"name": f"Product {index}"},
+        }
+        for index in range(10)
+    ]
+    sources = browser._sources(
+        [
+            {
+                "url": "http://store.test/agent/shop/search?q=categories",
+                "page": {
+                    "page": {"type": "search-results", "title": "Search"},
+                    "entities": entities,
+                },
+            }
+        ]
+    )
+    assert sources == []
+
+
+def test_sources_use_a_requested_citation_from_a_list_page(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """A model citation remains a titled, addressable source without opening the record."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/jacket"
+    observations = [
+        {
+            "url": "http://store.test/agent/shop/search?q=hiking",
+            "page": {
+                "page": {"type": "search-results", "title": "Search"},
+                "entities": [
+                    {
+                        "id": "jacket",
+                        "type": "record",
+                        "resource": "products",
+                        "href": href,
+                        "data": {"name": "Waterproof Hiking Jacket"},
+                    },
+                    {
+                        "id": "mat",
+                        "type": "record",
+                        "resource": "products",
+                        "href": "http://store.test/agent/shop/resources/products/mat",
+                        "data": {"name": "Adjustable Yoga Mat"},
+                    },
+                ],
+            },
+        }
+    ]
+    sources = browser._sources(observations, [href])
+    assert sources == [
+        {
+            "label": "products/jacket",
+            "href": href,
+            "title": "Waterproof Hiking Jacket",
+            "product": {"record_id": "jacket", "name": "Waterproof Hiking Jacket"},
+        }
+    ]
+
+
+def test_sources_expose_trusted_catalog_product_for_selection(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Selectable sources carry catalog identity; the model text is not the purchase record."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/rec-sneakers"
+    sources = browser._sources(
+        [
+            {
+                "url": "http://store.test/agent/shop/search?q=shoes",
+                "page": {
+                    "page": {"type": "search-results", "title": "Search"},
+                    "entities": [
+                        {
+                            "id": "rec-sneakers",
+                            "type": "record",
+                            "resource": "products",
+                            "href": href,
+                            "data": {
+                                "product_id": "5",
+                                "sku": "FAS-001",
+                                "name": "Classic Canvas Sneakers",
+                                "brand": "Northline",
+                                "price": "59.95",
+                                "currency": "USD",
+                                "availability": "in_stock",
+                                "stock_quantity": "33",
+                            },
+                            "commerce": {
+                                "id": "FAS-001",
+                                "title": "Classic Canvas Sneakers",
+                                "description": "Everyday low-top sneakers",
+                                "price": 5995,
+                                "currency": "USD",
+                                "availability": "in_stock",
+                                "inventory": 33,
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        [href],
+    )
+
+    assert sources[0]["title"] == "Classic Canvas Sneakers"
+    assert sources[0]["label"] == "products/rec-sneakers"
+    assert sources[0]["href"] == href
+    assert sources[0]["product"] == {
+        "record_id": "rec-sneakers",
+        "id": "FAS-001",
+        "sku": "FAS-001",
+        "name": "Classic Canvas Sneakers",
+        "brand": "Northline",
+        "price": 59.95,
+        "currency": "USD",
+        "availability": "in_stock",
+        "inventory": 33,
+    }
+
+
+def test_sources_without_product_facts_keep_title_href_and_label(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Opaque records remain normal sources and do not become selectable products."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    href = "http://store.test/agent/shop/resources/products/deadbeefcafebabe"
+    sources = browser._sources(
+        [
+            {
+                "url": href,
+                "page": {
+                    "page": {"type": "record", "title": "deadbeefcafebabe"},
+                    "data": {"resource": "products", "_id": "deadbeefcafebabe", "data": {}},
+                },
+            }
+        ]
+    )
+    assert sources == [
+        {
+            "label": "products/deadbeefcafebabe",
+            "href": href,
+            "title": "deadbeefcafebabe",
+        }
+    ]
+    assert "product" not in sources[0]
+
+
+def test_sources_keep_one_entry_per_cited_product(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Each cited catalog record remains independently selectable."""
+    browser = AgentBrowser(
+        ModelGateway(_settings(tmp_path), commerce_config), object(), commerce_config
+    )
+    sneakers = "http://store.test/agent/shop/resources/products/sneakers"
+    jacket = "http://store.test/agent/shop/resources/products/jacket"
+    sources = browser._sources(
+        [
+            {
+                "url": "http://store.test/agent/shop/search?q=gear",
+                "page": {
+                    "page": {"type": "search-results", "title": "Search"},
+                    "entities": [
+                        {
+                            "id": "sneakers",
+                            "type": "record",
+                            "resource": "products",
+                            "href": sneakers,
+                            "data": {"name": "Classic Canvas Sneakers", "brand": "Northline"},
+                        },
+                        {
+                            "id": "jacket",
+                            "type": "record",
+                            "resource": "products",
+                            "href": jacket,
+                            "data": {"name": "Waterproof Hiking Jacket", "brand": "Trailmark"},
+                        },
+                    ],
+                },
+            }
+        ],
+        [sneakers, jacket],
+    )
+    assert [item["title"] for item in sources] == [
+        "Classic Canvas Sneakers",
+        "Waterproof Hiking Jacket",
+    ]
+    assert [item["product"]["record_id"] for item in sources] == ["sneakers", "jacket"]
+    assert all(item["href"] and item["label"] for item in sources)
+
+
+@pytest.mark.parametrize(
+    ("goal", "records", "must_include"),
+    [
+        (
+            "What products are available?",
+            [{"data": {"name": "Adjustable Yoga Mat", "category": "Sports"}}],
+            ["Adjustable Yoga Mat"],
+        ),
+        (
+            "Show the strongest rated items.",
+            [{"data": {"name": "Wooden Building Blocks", "rating": "4.9"}}],
+            ["Wooden Building Blocks"],
+        ),
+        (
+            "Which categories can I browse?",
+            [{"data": {"name": "USB-C Fast Charger", "category": "Electronics"}}],
+            ["Electronics"],
+        ),
+        (
+            "What is the cheapest product?",
+            [{"data": {"name": "Minimalist Leather Notebook", "price": "18.75"}}],
+            ["Minimalist Leather Notebook"],
+        ),
+        (
+            "Do you have anything for hiking?",
+            [{"data": {"name": "Waterproof Hiking Jacket", "category": "Apparel"}}],
+            ["Waterproof Hiking Jacket"],
+        ),
+        (
+            "Tell me all available products.",
+            [
+                {"data": {"name": "Adjustable Yoga Mat"}},
+                {"commerce": {"title": "Organic Cotton Bedding Set"}, "data": {"sku": "HM-002"}},
+            ],
+            ["Adjustable Yoga Mat", "Organic Cotton Bedding Set"],
+        ),
+    ],
+)
+def test_summarize_prefers_readable_names_for_typical_shopper_goals(
+    tmp_path: Path,
+    commerce_config: CommerceConfig,
+    goal: str,
+    records: list[dict[str, Any]],
+    must_include: list[str],
+) -> None:
+    """Deterministic fallback names products; opaque ids stay out of the primary text."""
+    gateway = ModelGateway(_settings(tmp_path), commerce_config)
+    opaque = "a" * 64
+    tagged = [{**item, "_id": opaque, "resource": "products"} for item in records]
+    summary = gateway._summarize(tagged)
+    assert summary.startswith(commerce_config.model.deterministic_intro)
+    for text in must_include:
+        assert text in summary
+    assert f"products/{opaque}" not in summary
+    assert "/agent/" not in summary
+
+
+def _gateway_message(payload: Any) -> Any:
+    """Wrap a provider payload the same way AnyLLM returns parsed structured output."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=payload, content=None))]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid"),
+    [
+        ({"operation": "follow", "target": "http://store.test/agent/shop/products"}, True),
+        (
+            {
+                "operation": "follow",
+                "target": "http://store.test/agent/shop/products",
+                "citations": ["http://store.test/agent/shop/resources/products/a"],
+            },
+            False,
+        ),
+        (
+            {
+                "operation": "follow",
+                "target": "http://store.test/agent/shop/products",
+                "answer": "Apparel and Beauty",
+            },
+            False,
+        ),
+        ({"operation": "follow"}, False),
+        (
+            {
+                "operation": "answer",
+                "answer": "The jacket is in stock.",
+                "citations": ["http://store.test/agent/shop/resources/products/a"],
+            },
+            True,
+        ),
+        (
+            {"operation": "submit", "target": "search", "inputs": {"q": "hiking"}},
+            True,
+        ),
+    ],
+)
+def test_browser_decision_xor_contract(payload: dict[str, Any], valid: bool) -> None:
+    """Keep the public navigation/answer XOR strict regardless of provider envelope recovery."""
+    if valid:
+        BrowserDecision.model_validate(payload)
+        return
+    with pytest.raises(ValidationError):
+        BrowserDecision.model_validate(payload)
+
+
+def test_provider_follow_with_citations_is_recovered_to_navigation() -> None:
+    """Providers may cite the href they are about to follow; that is not an answer."""
+    href = "http://store.test/agent/shop/resources/products"
+    decision = ModelGateway._decision(
+        _gateway_message(
+            {
+                "operation": "follow",
+                "target": href,
+                "answer": None,
+                "citations": [f"{href}/abc"],
+                "inputs": {},
+            }
+        )
+    )
+    assert decision == BrowserDecision(operation="follow", target=href)
+
+
+def test_provider_follow_with_null_inputs_is_recovered() -> None:
+    """JSON null inputs are equivalent to omitted inputs on a follow."""
+    href = "http://store.test/agent/shop/resources/products"
+    parsed = ProviderDecision.model_validate(
+        {"operation": "follow", "target": href, "inputs": None}
+    )
+    decision = ModelGateway._decision(_gateway_message(parsed))
+    assert decision == BrowserDecision(operation="follow", target=href, inputs={})
+
+
+def test_provider_follow_with_answer_text_is_not_recovered() -> None:
+    """Non-empty answer text on navigation remains a contract failure."""
+    with pytest.raises(AgentResponseError, match="invalid browser decision"):
+        ModelGateway._decision(
+            _gateway_message(
+                {
+                    "operation": "follow",
+                    "target": "http://store.test/agent/shop/resources/products",
+                    "answer": "You can browse Apparel.",
+                }
+            )
+        )
+
+
+def test_provider_follow_without_target_is_not_recovered() -> None:
+    """Recovery must not invent a navigation target."""
+    with pytest.raises(AgentResponseError, match="invalid browser decision"):
+        ModelGateway._decision(
+            _gateway_message({"operation": "follow", "citations": ["http://store.test/x"]})
+        )
+
+
+def test_provider_submit_with_citations_is_recovered() -> None:
+    """Citations on submit are dropped when there is no shopper answer text."""
+    decision = ModelGateway._decision(
+        _gateway_message(
+            {
+                "operation": "submit",
+                "target": "search",
+                "inputs": {"q": "hiking"},
+                "citations": ["http://store.test/agent/shop/resources/products/a"],
+            }
+        )
+    )
+    assert decision == BrowserDecision(operation="submit", target="search", inputs={"q": "hiking"})
+
+
+def test_browser_follows_resource_before_answering_from_record_fields(
+    tmp_path: Path, commerce_config: CommerceConfig
+) -> None:
+    """Home resource names are not merchandising facts; record fields after follow are."""
+    home_url = "http://store.test/agent/shop/"
+    products_url = "http://store.test/agent/shop/resources/products"
+    app = FastAPI()
+
+    @app.get("/agent/shop/")
+    def home() -> dict[str, Any]:
+        """Expose a products collection without category values."""
+        return {
+            "page": {"id": home_url, "type": "store", "title": "Example Store"},
+            "data": {"resource_count": 1},
+            "entities": [
+                {
+                    "id": "products",
+                    "type": "resource",
+                    "title": "products",
+                    "href": products_url,
+                    "record_count": 2,
+                }
+            ],
+            "links": [{"rel": ["self"], "href": home_url}],
+            "actions": [],
+            "meta": {},
+        }
+
+    @app.get("/agent/shop/resources/products")
+    def products() -> dict[str, Any]:
+        """Return record entities whose data carries merchandising categories."""
+        return {
+            "page": {"id": products_url, "type": "resource", "title": "products"},
+            "data": {"name": "products"},
+            "entities": [
+                {
+                    "id": "a",
+                    "type": "record",
+                    "resource": "products",
+                    "href": f"{products_url}/a",
+                    "data": {"name": "Jacket", "category": "Apparel"},
+                },
+                {
+                    "id": "b",
+                    "type": "record",
+                    "resource": "products",
+                    "href": f"{products_url}/b",
+                    "data": {"name": "Serum", "category": "Beauty"},
+                },
+            ],
+            "links": [{"rel": ["self"], "href": products_url}],
+            "actions": [],
+            "meta": {},
+        }
+
+    class ScriptedModel:
+        """Follow the products resource, then answer from observed category fields."""
+
+        async def acompletion(self, **kwargs: Any) -> Any:
+            """Choose advertised controls from the current page JSON only."""
+            prompt = kwargs["messages"][-1]["content"]
+            assert "without answer text or citations" in prompt
+            current = prompt.split("<current-agent-page>", 1)[1].split("</current-agent-page>", 1)[
+                0
+            ]
+            page = json.loads(current)
+            if page["page"]["type"] == "store":
+                payload = {
+                    "operation": "follow",
+                    "target": products_url,
+                    "citations": [products_url],
+                }
+            else:
+                categories = sorted(
+                    {
+                        str(item["data"]["category"])
+                        for item in page.get("entities", [])
+                        if isinstance(item, dict) and item.get("data", {}).get("category")
+                    }
+                )
+                payload = {
+                    "operation": "answer",
+                    "answer": f"You can browse {', '.join(categories)}.",
+                }
+            return _gateway_message(payload)
+
+    gateway = ModelGateway(
+        _settings(tmp_path, provider="scripted", model="scripted"), commerce_config
+    )
+    gateway.client = ScriptedModel()
+    result = asyncio.run(
+        AgentBrowser(gateway, app, commerce_config).run("Which categories can I browse?", home_url)
+    )
+
+    assert result["mode"] == "agent"
+    assert "Apparel" in result["answer"]
+    assert "Beauty" in result["answer"]
+    assert result["answer"] != "You can browse the products category."
+    assert "/agent/" not in result["answer"]
+    assert result["sources"] == []
+    assert [item["page_type"] for item in result["trace"]] == ["store", "resource"]
