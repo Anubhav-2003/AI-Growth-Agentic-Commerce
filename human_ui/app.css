@@ -2,5 +2,5 @@
 @import url("./demo-day.css");
 
 /* Keep the static asset contract visible to integration checks while the real rules live in imports. */
-:root { --moss: #0a66ff; }
+:root { --moss: #000000; }
 .product-pick, .product-qty, .purchase-line {}
