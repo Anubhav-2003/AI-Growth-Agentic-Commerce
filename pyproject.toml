@@ -19,6 +19,7 @@ dependencies = [
   "pyyaml==6.0.3",
   "rapidfuzz==3.14.5",
   "razorpay==2.0.1",
+  "socksio==1.0.0",
   "ucp-sdk==0.5.0",
   "uvicorn[standard]==0.52.4",
 ]

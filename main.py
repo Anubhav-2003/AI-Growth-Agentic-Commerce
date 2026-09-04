@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -12,7 +13,7 @@ from urllib.parse import quote
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -78,6 +79,11 @@ def _sync_view(sync: dict[str, Any]) -> dict[str, Any]:
         warning_count=counts.get("warnings", len(result.get("warnings") or [])),
     )
     return result
+
+
+def _sse(event: str, payload: dict[str, Any]) -> str:
+    """Encode one compact server-sent event without permitting line injection."""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
 
 def create_app(
@@ -222,6 +228,11 @@ def create_app(
         target = str(request.url_for("dashboard"))
         return RedirectResponse(f"{target}#sources" if request.url.path == "/register" else target)
 
+    @app.get("/shop", include_in_schema=False)
+    def shopper_portal(request: Request) -> RedirectResponse:
+        """Give presenters and shoppers a memorable URL for the customer storefront."""
+        return RedirectResponse(f"{request.url_for('dashboard')}#store")
+
     @app.get(f"{config.routes.api}/health", tags=["operations"])
     def health() -> dict[str, str]:
         """Report process health without claiming database readiness."""
@@ -326,6 +337,66 @@ def create_app(
         root = str(request.base_url).rstrip("/")
         entry = f"{root}{config.routes.agent}/{quote(str(vendor['slug']), safe='')}/"
         return await request.app.state.agent_browser.run(payload.message, entry, payload.history)
+
+    @management.post("/vendors/{reference}/chat/stream")
+    async def stream_chat(
+        reference: str, payload: ChatRequest, request: Request
+    ) -> StreamingResponse:
+        """Stream safe agent activity before delivering the complete grounded answer."""
+        vendor = _vendor_or_404(catalog, reference)
+        if len(payload.message) > config.limits.chat_question_characters:
+            raise HTTPException(status_code=400, detail="The chat question is too long.")
+        if len(payload.history) > config.limits.chat_history_messages:
+            raise HTTPException(status_code=400, detail="The chat history is too long.")
+        if sum(len(item.get("content", "")) for item in payload.history) > (
+            config.limits.chat_context_characters
+        ):
+            raise HTTPException(status_code=400, detail="The chat history is too large.")
+        root = str(request.base_url).rstrip("/")
+        entry = f"{root}{config.routes.agent}/{quote(str(vendor['slug']), safe='')}/"
+
+        async def events():
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+            async def publish(event: dict[str, Any]) -> None:
+                await queue.put(event)
+
+            task = asyncio.create_task(
+                request.app.state.agent_browser.run(
+                    payload.message, entry, payload.history, on_event=publish
+                )
+            )
+            yield _sse(
+                "activity",
+                {
+                    "label": "Understanding your request",
+                    "detail": f"Searching {vendor.get('name') or 'the selected store'}",
+                    "operation": "start",
+                },
+            )
+            try:
+                while not task.done() or not queue.empty():
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                    except TimeoutError:
+                        continue
+                    yield _sse("activity", event)
+                result = await task
+                yield _sse("result", result)
+            except AgentResponseError:
+                yield _sse("error", {"detail": config.model.unavailable})
+            except Exception as error:
+                LOGGER.exception("Streaming chat failed", exc_info=error)
+                yield _sse("error", {"detail": "The grounded answer could not be completed."})
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @management.post("/vendors/{reference}/purchases/review")
     def review_purchase(reference: str, payload: PurchaseReviewRequest) -> dict[str, Any]:

@@ -22,7 +22,9 @@ class CommerceMapping(StrictModel):
     resource: str = Field(min_length=1)
     fields: dict[str, str] = Field(default_factory=dict)
     price_units: Literal["major", "minor"] | None = None
-    default_currency: str | None = Field(default=None, min_length=3, max_length=3)
+    default_currency: str | None = Field(
+        default=None, min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$"
+    )
 
     @field_validator("default_currency")
     @classmethod

@@ -26,6 +26,7 @@ const state = {
   resource: null, record: null, recordsCursor: null, catalogQuery: "",
   mappingResource: null, agentDocument: "home", agentJson: null,
   chat: [], chatPending: false, selectedProducts: [], cartItems: [],
+  shopProducts: [], shopLoading: false, shopQuery: "", shopCategory: "",
   purchase: null, purchasePhase: "selected", purchaseBusy: false, syncing: false, epoch: 0,
 };
 const numberFormatter = new Intl.NumberFormat();
@@ -127,8 +128,9 @@ function agentHome(vendor = state.vendor) {
 
 // Restrict rendered chat links to normal HTTP URLs.
 function safeUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
   try {
-    const url = new URL(String(value), window.location.origin);
+    const url = new URL(value.trim(), window.location.origin);
     return ["http:", "https:"].includes(url.protocol) ? url.href : "";
   } catch { return ""; }
 }
@@ -168,6 +170,7 @@ function notify(message, kind = "success") {
 // Move between semantic views and load view-specific live data when needed.
 function navigate(view, updateHash = true) {
   const target = document.querySelector(`[data-page="${view}"]`) ? view : "overview";
+  document.body.dataset.activeView = target;
   document.querySelectorAll("[data-page]").forEach((section) => { section.hidden = section.dataset.page !== target; });
   document.querySelectorAll("[data-view]").forEach((button) => {
     const active = button.dataset.view === target;
@@ -176,6 +179,7 @@ function navigate(view, updateHash = true) {
   });
   if (updateHash) history.replaceState(null, "", `#${target}`);
   if (target === "agent") loadAgentDocument();
+  if (target === "store" && state.vendor && !state.shopProducts.length && !state.shopLoading) loadStoreProducts();
   byId("main-content").focus({ preventScroll: true });
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -254,6 +258,10 @@ async function selectVendor(vendor) {
   state.chat = [];
   state.selectedProducts = [];
   state.cartItems = [];
+  state.shopProducts = [];
+  state.shopLoading = false;
+  state.shopQuery = "";
+  state.shopCategory = "";
   state.purchase = null;
   state.purchasePhase = "selected";
   state.purchaseBusy = false;
@@ -295,7 +303,7 @@ async function loadVendorBundle(epoch = state.epoch) {
     showState(byId("activity-list"), "History unavailable", requests[2].reason.message, "Retry", loadVendorBundle, true);
     showState(byId("recent-sync"), "History unavailable", requests[2].reason.message, "Retry", loadVendorBundle, true);
   }
-  if (state.resource) await loadRecords();
+  if (state.resource) await Promise.all([loadRecords(), loadStoreProducts()]);
 }
 
 // Derive projection readiness from explicit mapping facts only.
@@ -516,6 +524,163 @@ function handleRecordClick(event) {
 function renderRecordInspector() {
   byId("record-json").textContent = state.record ? JSON.stringify(state.record, null, 2) : "Select a record to inspect every retained field.";
   byId("copy-record").disabled = !state.record;
+}
+
+// Read an explicitly mapped field path without making source data lossy.
+function mappedValue(data, path) {
+  if (!path || !data || typeof data !== "object") return undefined;
+  if (Object.hasOwn(data, path)) return data[path];
+  return String(path).split(".").reduce((value, key) => value && typeof value === "object" ? value[key] : undefined, data);
+}
+
+// Convert one normalized record into the small customer-facing product shape.
+function shopProduct(record) {
+  const data = rawRecord(record);
+  const commerce = record?.commerce && typeof record.commerce === "object" ? record.commerce : {};
+  const mapping = state.vendor?.mapping || {};
+  const fields = mapping.fields || {};
+  const read = (target, fallbacks = []) => commerce[target] ?? mappedValue(data, fields[target]) ?? fallbacks.map((key) => data?.[key]).find((value) => value !== undefined && value !== null && value !== "");
+  const recordId = String(record?.record_id || record?.id || record?._id || "");
+  const name = String(read("title", ["title", "name", "product_name"]) || "").trim();
+  if (!recordId || !name) return null;
+  let price = Number(read("price", ["price", "amount", "selling_price"]));
+  if (Number.isFinite(price) && (commerce.price !== undefined || mapping.price_units === "minor")) price /= 100;
+  const currencyValue = String(read("currency", ["currency", "currency_code"]) || mapping.default_currency || "").trim().toUpperCase();
+  const currency = /^[A-Z]{3}$/.test(currencyValue) ? currencyValue : "";
+  const image = safeUrl(read("image", ["image", "image_url", "thumbnail", "photo"]));
+  const inventory = Number(read("inventory", ["inventory", "stock", "stock_quantity", "quantity"]));
+  return {
+    record_id: recordId,
+    id: String(read("id", ["id", "sku", "asin"]) || ""),
+    name,
+    description: String(read("description", ["description", "summary", "details"]) || "").trim(),
+    brand: String(read("brand", ["brand", "manufacturer"]) || "").trim(),
+    category: String(read("category", ["category", "department", "type"]) || "").trim(),
+    availability: String(read("availability", ["availability", "status"]) || "").trim(),
+    inventory: Number.isFinite(inventory) && inventory >= 0 ? inventory : undefined,
+    price: Number.isFinite(price) && price >= 0 ? price : undefined,
+    currency,
+    image,
+  };
+}
+
+// Fetch the mapped product resource for the customer storefront.
+async function loadStoreProducts() {
+  if (!state.vendor || state.shopLoading) return;
+  const preferred = state.resources.find((item) => /product|catalog|item/i.test(resourceName(item))) || state.resources[0];
+  const resource = state.vendor?.mapping?.resource || (preferred && resourceName(preferred));
+  if (!resource) {
+    state.shopProducts = [];
+    renderStore();
+    return;
+  }
+  const epoch = state.epoch;
+  state.shopLoading = true;
+  renderStore();
+  try {
+    const params = new URLSearchParams({ resource: String(resource), limit: "100" });
+    const data = await fetchJson(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/records?${params}`));
+    if (epoch !== state.epoch) return;
+    state.shopProducts = listFrom(data, ["records", "items", "results", "data"]).map(shopProduct).filter(Boolean);
+  } catch (error) {
+    if (epoch === state.epoch) {
+      notify(`The storefront could not load: ${error.message}`, "error");
+      state.shopProducts = [];
+    }
+  } finally {
+    if (epoch === state.epoch) {
+      state.shopLoading = false;
+      renderStore();
+    }
+  }
+}
+
+function renderStoreProduct(container, product, index) {
+  const card = make("article", "store-product");
+  const media = make("div", "store-product-media");
+  if (product.image) {
+    const image = make("img");
+    image.src = product.image;
+    image.alt = product.name;
+    image.loading = "lazy";
+    image.addEventListener("error", () => image.remove());
+    media.append(image);
+  }
+  media.append(make("span", "store-product-index", String(index + 1).padStart(2, "0")));
+  const body = make("div", "store-product-body");
+  const top = make("div", "store-product-top");
+  const identity = make("div");
+  if (product.brand || product.category) identity.append(make("span", "store-product-meta", product.brand || product.category));
+  identity.append(make("h2", "", product.name));
+  top.append(identity, make("strong", "store-product-price", formatMoney(product) || "Price unavailable"));
+  body.append(top);
+  if (product.description) body.append(make("p", "", product.description));
+  const footer = make("div", "store-product-footer");
+  const stock = stockMessage(product);
+  footer.append(make("span", "store-stock", stock || "Availability checked at checkout"));
+  const button = make("button", selectedEntry(product) ? "button button-secondary" : "button button-primary", selectedEntry(product) ? "Added ✓" : "Add to cart");
+  button.type = "button";
+  button.dataset.storeProduct = productKey(product);
+  button.disabled = !Number.isFinite(Number(product.price)) || !product.currency;
+  footer.append(button);
+  body.append(footer);
+  card.append(media, body);
+  container.append(card);
+}
+
+// Render a calm, customer-first catalog and its shared checkout selection.
+function renderStore() {
+  const products = byId("store-products");
+  const categorySelect = byId("store-category");
+  if (!products || !categorySelect) return;
+  byId("store-summary").textContent = state.vendor ? `Browse ${state.vendor.name || "the selected store"}, or let the AI buyer search the same live catalog.` : "Select a storefront to browse its published catalog.";
+  const categories = [...new Set(state.shopProducts.map((item) => item.category).filter(Boolean))].sort();
+  const selectedCategory = state.shopCategory;
+  categorySelect.replaceChildren(Object.assign(make("option", "", "All categories"), { value: "" }));
+  for (const category of categories) categorySelect.append(Object.assign(make("option", "", category), { value: category, selected: category === selectedCategory }));
+  const query = state.shopQuery.toLowerCase();
+  const visible = state.shopProducts.filter((item) => (!selectedCategory || item.category === selectedCategory) && (!query || [item.name, item.brand, item.category, item.description].join(" ").toLowerCase().includes(query)));
+  byId("store-result-count").textContent = state.shopLoading ? "Loading catalog…" : `${visible.length} ${visible.length === 1 ? "product" : "products"}`;
+  products.replaceChildren();
+  if (state.shopLoading) showLoading(products, "Loading the live catalog…");
+  else if (!state.vendor) showState(products, "Choose a storefront", "Select a connected store above to browse products.");
+  else if (!state.shopProducts.length) showState(products, "No shoppable products yet", "Sync the catalog and publish a product mapping to open the customer storefront.", "Review mapping", () => navigate("mapping"));
+  else if (!visible.length) showState(products, "No matching products", "Try a different search or category.");
+  else visible.forEach((product, index) => renderStoreProduct(products, product, index));
+  renderStoreCart();
+}
+
+function renderStoreCart() {
+  const container = byId("store-cart-items");
+  if (!container) return;
+  container.replaceChildren();
+  byId("store-cart-count").textContent = String(state.selectedProducts.length);
+  if (!state.selectedProducts.length) container.append(make("p", "store-cart-empty", "Your cart is empty. Add a product or ask the AI buyer for help."));
+  for (const item of state.selectedProducts) {
+    const row = make("div", "store-cart-row");
+    const copy = make("div");
+    copy.append(make("strong", "", item.name), make("span", "", formatMoney(item)));
+    const remove = make("button", "icon-button", "×");
+    remove.type = "button";
+    remove.dataset.removeProduct = productKey(item);
+    remove.setAttribute("aria-label", `Remove ${item.name}`);
+    row.append(copy, remove);
+    container.append(row);
+  }
+  const currency = state.selectedProducts[0]?.currency;
+  byId("store-cart-total").textContent = state.selectedProducts.length ? formatAmount(selectionTotal(state.selectedProducts), currency) || "—" : "—";
+  byId("store-checkout").disabled = !state.selectedProducts.length || state.purchaseBusy;
+}
+
+function handleStoreAction(event) {
+  const control = event.target.closest("[data-store-product], [data-remove-product]");
+  if (!control) return;
+  if (control.dataset.removeProduct) removeSelectedProduct(control.dataset.removeProduct);
+  else {
+    const product = state.shopProducts.find((item) => productKey(item) === control.dataset.storeProduct);
+    if (product && !selectedEntry(product)) selectProduct(product);
+  }
+  renderStore();
 }
 
 // Return field names from observed schema variants.
@@ -787,13 +952,17 @@ function selectedEntry(product) {
 
 function formatAmount(amount, currency) {
   const value = Number(amount);
-  const code = String(currency || "USD").trim() || "USD";
-  if (!Number.isFinite(value)) return "";
+  const code = String(currency || "").trim().toUpperCase();
+  if (!Number.isFinite(value) || !/^[A-Z]{3}$/.test(code)) return "";
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency: code }).format(value);
   } catch {
     return `${value} ${code}`;
   }
+}
+
+function purchasableProduct(product) {
+  return Number.isFinite(Number(product?.price)) && /^[A-Z]{3}$/.test(String(product?.currency || "").toUpperCase());
 }
 
 function formatMoney(product) {
@@ -885,7 +1054,8 @@ function appendProductCard(container, source, messageIndex, sourceIndex) {
   button.dataset.message = String(messageIndex);
   button.dataset.source = String(sourceIndex);
   button.setAttribute("aria-pressed", String(Boolean(selected)));
-  button.textContent = selected ? "Selected ✓" : "Select product";
+  button.disabled = !purchasableProduct(product);
+  button.textContent = selected ? "Selected ✓" : purchasableProduct(product) ? "Select product" : "Currency mapping required";
   actions.append(button);
   if (selected) {
     const remove = make("button", "button button-quiet product-pick-remove", "Remove");
@@ -899,7 +1069,10 @@ function appendProductCard(container, source, messageIndex, sourceIndex) {
 
 function selectProduct(product) {
   const key = productKey(product);
-  if (!key) return;
+  if (!key || !purchasableProduct(product)) {
+    notify("This product needs a valid price and 3-letter currency mapping before checkout.", "warning");
+    return;
+  }
   if (selectedEntry(product)) {
     renderChat();
     return;
@@ -912,6 +1085,7 @@ function selectProduct(product) {
     local: true,
   });
   renderChat();
+  renderStore();
 }
 
 function changeQuantity(key, delta) {
@@ -921,6 +1095,7 @@ function changeQuantity(key, delta) {
   if (next === quantityValue(item)) return;
   item.quantity = next;
   renderChat();
+  renderStore();
 }
 
 function removeSelectedProduct(key) {
@@ -929,6 +1104,7 @@ function removeSelectedProduct(key) {
   if (remaining.length === state.selectedProducts.length) return;
   state.selectedProducts = remaining;
   renderChat();
+  renderStore();
 }
 
 function addToCart() {
@@ -953,6 +1129,10 @@ function purchaseLines() {
 
 async function reviewPurchase() {
   if (!state.vendor || !state.selectedProducts.length || state.purchaseBusy) return;
+  if (!state.selectedProducts.every(purchasableProduct)) {
+    notify("Every selected product needs a valid price and currency before checkout.", "warning");
+    return;
+  }
   state.purchaseBusy = true;
   renderChat();
   try {
@@ -1181,7 +1361,7 @@ function appendSummaryCard(container, item) {
 }
 
 function handleProductSelect(event) {
-  const control = event.target.closest("[data-select-product], [data-quantity-delta], [data-remove-product], [data-add-to-cart], [data-buy-now], [data-review-purchase], [data-confirm-purchase], [data-cancel-purchase]");
+  const control = event.target.closest("[data-select-product], [data-quantity-delta], [data-remove-product], [data-add-to-cart], [data-buy-now], [data-review-purchase], [data-confirm-purchase], [data-retry-payment-confirmation], [data-cancel-purchase]");
   if (!control) return;
   event.preventDefault();
   if (control.dataset.selectProduct) {
@@ -1234,10 +1414,22 @@ function renderChat() {
   }
   state.chat.forEach((message, messageIndex) => {
     const item = make("article", `chat-message is-${message.role === "user" ? "user" : "assistant"}${message.mode === "error" ? " is-error" : ""}`);
-    item.append(
-      make("span", "chat-message-label", message.role === "user" ? "You" : settings.appName),
-      make("div", "chat-bubble", message.content)
-    );
+    item.append(make("span", "chat-message-label", message.role === "user" ? "You" : settings.appName));
+    if (message.progress?.length) {
+      const activity = make("details", `chat-activity${message.streaming ? " is-live" : ""}`);
+      activity.open = Boolean(message.streaming);
+      const summary = make("summary", "", message.streaming ? message.progress.at(-1).label : `Searched the live catalog · ${message.progress.length} ${message.progress.length === 1 ? "step" : "steps"}`);
+      const list = make("div", "chat-activity-list");
+      message.progress.forEach((event) => {
+        const row = make("div", "chat-activity-row");
+        row.append(make("span", "chat-activity-dot"), make("strong", "", event.label || "Checked store data"));
+        if (event.detail) row.append(make("small", "", event.detail));
+        list.append(row);
+      });
+      activity.append(summary, list);
+      item.append(activity);
+    }
+    if (message.content) item.append(make("div", `chat-bubble${message.role === "assistant" ? " is-revealed" : ""}`, message.content));
     if (message.sources?.length) {
       const sources = make("div", "chat-sources");
       message.sources.forEach((source, sourceIndex) => {
@@ -1265,7 +1457,7 @@ function renderChat() {
     }
     log.append(item);
   });
-  if (state.chatPending) {
+  if (state.chatPending && !state.chat.some((message) => message.streaming)) {
     const item = make("article", "chat-message is-assistant");
     const dots = make("div", "typing");
     dots.setAttribute("aria-label", `${settings.appName} is writing`);
@@ -1277,6 +1469,34 @@ function renderChat() {
   byId("chat-submit").disabled = !state.vendor || state.chatPending;
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
   renderChatContext();
+}
+
+// Parse a POST response as server-sent events without relying on EventSource's GET-only API.
+async function consumeChatStream(response, onEvent) {
+  if (!response.ok) {
+    const text = await response.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text }; }
+    throw new Error(errorMessage(data, response.status));
+  }
+  if (!response.body) throw new Error("Live chat is not supported by this browser.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replaceAll("\r\n", "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const event = block.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+      const json = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (json) onEvent(event, JSON.parse(json));
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
 }
 
 // Show exactly which storefront bounds apply to agent browsing.
@@ -1294,7 +1514,7 @@ function renderChatContext() {
   }
   container.replaceChildren(stats);
   if (state.selectedProducts.length) {
-    const currency = state.selectedProducts[0]?.currency || "USD";
+    const currency = state.selectedProducts[0]?.currency;
     const chosen = make("div", "selected-items");
     chosen.append(make("span", "selected-product-label", "Selected items"));
     for (const item of state.selectedProducts) appendSummaryCard(chosen, item);
@@ -1373,13 +1593,29 @@ async function sendChat(event) {
   if (!message || !state.vendor || state.chatPending) return;
   const history = state.chat.filter((item) => !item.local).slice(-settings.chatHistoryLimit).map((item) => ({ role: item.role, content: item.content }));
   state.chat.push({ role: "user", content: message });
+  const responseMessage = { role: "assistant", content: "", mode: "grounded", sources: [], trace: [], progress: [], streaming: true };
+  state.chat.push(responseMessage);
   state.chatPending = true;
   input.value = "";
   resizeChatInput();
   renderChat();
   try {
-    const result = await fetchJson(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/chat`), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, history }) });
-    state.chat.push({ role: "assistant", content: result?.answer || "No grounded answer was returned.", mode: result?.mode || "grounded", sources: result?.sources || [], trace: result?.trace || [] });
+    const response = await fetch(apiUrl(`/vendors/${encodeURIComponent(idOf(state.vendor))}/chat/stream`), { method: "POST", headers: { Accept: "text/event-stream", "Content-Type": "application/json" }, body: JSON.stringify({ message, history }) });
+    await consumeChatStream(response, (type, payload) => {
+      if (type === "activity") {
+        responseMessage.progress.push(payload);
+        renderChat();
+      } else if (type === "result") {
+        responseMessage.content = payload?.answer || "No grounded answer was returned.";
+        responseMessage.mode = payload?.mode || "grounded";
+        responseMessage.sources = payload?.sources || [];
+        responseMessage.trace = payload?.trace || [];
+      } else if (type === "error") {
+        responseMessage.content = payload?.detail || "The grounded answer could not be completed.";
+        responseMessage.mode = "error";
+      }
+    });
+    responseMessage.streaming = false;
     if (looksLikeBuyIntent(message) && state.selectedProducts.length) {
       state.chat.push({
         role: "assistant",
@@ -1389,9 +1625,11 @@ async function sendChat(event) {
         purchasePrompt: true,
       });
     }
-    byId("chat-mode").textContent = result?.mode === "agent" || result?.mode === "deterministic" ? "In conversation" : "Ready";
+    byId("chat-mode").textContent = responseMessage.mode === "agent" || responseMessage.mode === "deterministic" ? "In conversation" : "Ready";
   } catch (error) {
-    state.chat.push({ role: "assistant", content: `I could not retrieve a grounded answer: ${error.message}`, mode: "error", sources: [] });
+    responseMessage.streaming = false;
+    responseMessage.mode = "error";
+    responseMessage.content = `I could not retrieve a grounded answer: ${error.message}`;
   } finally {
     state.chatPending = false;
     renderChat();
@@ -1466,6 +1704,7 @@ function handleSuggestion(event) {
 
 // Render every view from the shared selected-store state.
 function renderAll() {
+  renderStore();
   renderOverview();
   renderSource();
   renderResources();
@@ -1493,6 +1732,11 @@ function bindEvents() {
   byId("resource-list").addEventListener("click", handleResourceClick);
   byId("records-body").addEventListener("click", handleRecordClick);
   byId("catalog-search").addEventListener("input", handleCatalogSearch);
+  byId("store-search").addEventListener("input", (event) => { state.shopQuery = event.target.value.trim(); renderStore(); });
+  byId("store-category").addEventListener("change", (event) => { state.shopCategory = event.target.value; renderStore(); });
+  byId("store-products").addEventListener("click", handleStoreAction);
+  byId("store-cart-items").addEventListener("click", handleStoreAction);
+  byId("store-checkout").addEventListener("click", async () => { navigate("chat"); await reviewPurchase(); });
   byId("overview-sync").addEventListener("click", syncVendor);
   byId("source-sync").addEventListener("click", syncVendor);
   byId("activity-sync").addEventListener("click", syncVendor);
@@ -1512,7 +1756,7 @@ function bindEvents() {
 async function init() {
   bindEvents();
   renderAll();
-  navigate(location.hash.slice(1) || "overview", false);
+  navigate(location.hash.slice(1) || "store", false);
   await Promise.all([loadHealth(), loadVendors()]);
 }
 

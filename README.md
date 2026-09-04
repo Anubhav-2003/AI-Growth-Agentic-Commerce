@@ -25,7 +25,8 @@ uv run python main.py
 
 The default local URLs are:
 
-- Dashboard: `http://127.0.0.1:8000/`
+- Customer storefront: `http://127.0.0.1:8000/shop`
+- Commerce workspace: `http://127.0.0.1:8000/`
 - API documentation: `http://127.0.0.1:8000/docs`
 - Health: `http://127.0.0.1:8000/api/health`
 - Mongo readiness: `http://127.0.0.1:8000/api/ready`
@@ -88,12 +89,13 @@ mongosh 'mongodb://127.0.0.1:27017' --eval 'db.runCommand({ping: 1})'
 
 Open `/` to use the single responsive control plane:
 
+- **Store** — browse mapped products, search and filter the live catalog, manage a cart, and enter the verified checkout flow
 - **Overview** — published totals, readiness, current endpoint, and recent sync
 - **Sources** — register CSV, JSON, or SQLite sources and start synchronization
 - **Catalog** — browse resources, search records, and inspect retained JSON
 - **Mapping** — review deterministic field-name suggestions and publish explicit semantics
 - **Agent site** — inspect the store home, UCP discovery document, and page schema
-- **Chat** — watch an AI traverse live machine pages and answer with exact record citations
+- **Chat** — watch live storefront activity collapse above a grounded answer, select cited products, and continue to verified checkout
 - **Activity** — inspect successful and failed revision history
 
 The old `/register`, `/login`, and `/home` URLs redirect to this dashboard. A remembered vendor ID in browser storage is only a UI selection preference; it is not authentication.
@@ -116,6 +118,7 @@ The old `/register`, `/login`, and `/home` URLs redirect to this dashboard. A re
 | `GET` | `/api/vendors/{reference}/records` | Active records; accepts `resource`, `q`, `cursor`, and `limit` |
 | `PUT` | `/api/vendors/{reference}/mapping` | Replace the explicit mapping and rebuild additive projections |
 | `POST` | `/api/vendors/{reference}/chat` | Grounded answer plus record-page citations |
+| `POST` | `/api/vendors/{reference}/chat/stream` | Safe live browsing activity followed by the grounded answer |
 | `POST` | `/api/vendors/{reference}/purchases/review` | Rebuild a purchase summary from live catalog data |
 | `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/authorize` | Explicit confirmation, spending bound, and optional TEST Checkout order |
 | `POST` | `/api/vendors/{reference}/purchases/{attempt_id}/payment/verify` | Server-side Checkout signature and payment verification |

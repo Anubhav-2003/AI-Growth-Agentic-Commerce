@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, TypedDict
@@ -208,6 +208,7 @@ class BrowserContext:
     client: httpx.AsyncClient
     origin: str
     store_path: str
+    on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
 
 class ModelGateway:
@@ -427,7 +428,11 @@ class AgentBrowser:
         self.graph = graph.compile(name="commerceos-agent-browser")
 
     async def run(
-        self, goal: str, entry_url: str, history: list[dict[str, str]] | None = None
+        self,
+        goal: str,
+        entry_url: str,
+        history: list[dict[str, str]] | None = None,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Open the home page and browse only within that storefront until answering."""
         parsed = urlparse(entry_url)
@@ -438,9 +443,18 @@ class AgentBrowser:
             ),
             origin=f"{parsed.scheme}://{parsed.netloc}",
             store_path=parsed.path.rstrip("/"),
+            on_event=on_event,
         )
         async with context.client:
             page, url = await self._request(context, "GET", entry_url)
+            await self._emit(
+                context,
+                {
+                    "label": "Opened the live storefront",
+                    "detail": str(page.get("page", {}).get("title") or "Store home"),
+                    "operation": "open",
+                },
+            )
             observation = {"url": url, "page": page}
             trace = [self._trace(0, "open", url, page)]
             if self.model.client is None:
@@ -514,6 +528,14 @@ class AgentBrowser:
                 ],
             }
         observation = {"url": url, "page": page}
+        await self._emit(
+            runtime.context,
+            {
+                "label": self._event_label(decision.operation, page),
+                "detail": str(page.get("page", {}).get("title") or "Catalog page"),
+                "operation": decision.operation,
+            },
+        )
         return {
             "current": page,
             "current_url": url,
@@ -605,6 +627,14 @@ class AgentBrowser:
                 "trace": trace,
             }
         observations = [observation, {"url": url, "page": page}]
+        await self._emit(
+            context,
+            {
+                "label": "Searched the published catalog",
+                "detail": str(page.get("page", {}).get("title") or goal),
+                "operation": "search",
+            },
+        )
         entities = [item for item in page.get("entities", []) if isinstance(item, dict)]
         records = [
             {
@@ -621,6 +651,28 @@ class AgentBrowser:
             "sources": self._sources(observations, matched),
             "trace": [*trace, self._trace(1, "submit", url, page)],
         }
+
+    @staticmethod
+    async def _emit(context: BrowserContext, event: dict[str, Any]) -> None:
+        """Report safe browsing activity without exposing prompts or model reasoning."""
+        if context.on_event is None:
+            return
+        try:
+            await context.on_event(event)
+        except Exception:
+            LOGGER.debug("Chat activity listener stopped accepting events", exc_info=True)
+
+    @staticmethod
+    def _event_label(operation: str, page: Mapping[str, Any]) -> str:
+        """Turn a machine transition into concise shopper-facing activity copy."""
+        page_type = str(page.get("page", {}).get("type") or "")
+        if page_type == "search-results":
+            return "Searched the published catalog"
+        if page_type == "record":
+            return "Checked a product record"
+        if page_type in {"resource", "resource-collection"}:
+            return "Browsed the catalog"
+        return "Followed a storefront link" if operation == "follow" else "Checked live store data"
 
     def _best_effort(self, state: BrowserState) -> str:
         """End safely with exact evidence if a provider ignores the forced-answer instruction."""

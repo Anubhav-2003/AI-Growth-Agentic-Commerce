@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="Operate your agent-native {{ app_name }} storefront." />
-    <meta name="theme-color" content="#103f31" />
-    <title>{{ app_name }} · Control plane</title>
+    <meta name="theme-color" content="#050505" />
+    <title>{{ app_name }} · Agent-native commerce</title>
     <link rel="stylesheet" href="{{ static_root }}/app.css" />
     <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
     <script src="{{ static_root }}/app.js" defer></script>
@@ -24,7 +24,10 @@
         </a>
 
         <nav class="primary-nav" aria-label="Workspace">
-          <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
+          <button class="nav-item is-active" type="button" data-view="store" aria-current="page">
+            <span aria-hidden="true">◫</span><span>Store</span>
+          </button>
+          <button class="nav-item" type="button" data-view="overview">
             <span aria-hidden="true">⌂</span><span>Overview</span>
           </button>
           <button class="nav-item" type="button" data-view="sources">
@@ -78,6 +81,36 @@
         </div>
 
         <main id="main-content" tabindex="-1">
+          <section class="view store-view" id="view-store" data-page="store" aria-labelledby="store-title">
+            <header class="store-masthead">
+              <div>
+                <p class="eyebrow">Live storefront</p>
+                <h1 id="store-title">Shop the catalog.</h1>
+                <p id="store-summary">Browse real inventory, add items, or ask the AI buyer to find the right product.</p>
+              </div>
+              <button class="button button-primary" type="button" data-go="chat">Shop with AI <span aria-hidden="true">→</span></button>
+            </header>
+            <div class="store-toolbar" aria-label="Product filters">
+              <label class="store-search"><span aria-hidden="true">⌕</span><span class="sr-only">Search products</span><input id="store-search" type="search" placeholder="Search products, brands, or categories" /></label>
+              <label class="store-category"><span class="sr-only">Filter by category</span><select id="store-category"><option value="">All categories</option></select></label>
+              <span id="store-result-count" class="store-result-count" aria-live="polite">Loading catalog…</span>
+            </div>
+            <div class="store-layout">
+              <section aria-label="Products">
+                <div id="store-products" class="store-products state-slot"></div>
+              </section>
+              <aside class="store-cart" aria-labelledby="store-cart-title">
+                <div class="store-cart-heading"><div><p class="kicker">Your selection</p><h2 id="store-cart-title">Cart</h2></div><span id="store-cart-count">0</span></div>
+                <div id="store-cart-items" class="store-cart-items"></div>
+                <div class="store-cart-footer">
+                  <span><small>Total</small><strong id="store-cart-total">—</strong></span>
+                  <button class="button button-primary" id="store-checkout" type="button" disabled>Review checkout</button>
+                  <p>Price and availability are verified before payment.</p>
+                </div>
+              </aside>
+            </div>
+          </section>
+
           <section class="view" id="view-overview" data-page="overview" aria-labelledby="overview-title">
             <div class="hero">
               <div class="hero-copy">
